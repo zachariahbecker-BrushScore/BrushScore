@@ -19,14 +19,14 @@ const AWARD_OPTIONS = [
 ];
 
 const DEFAULT_CATEGORIES = [
- { name: 'Junior (under 18 years only)' },
+  { name: 'Junior (under 18 years only)' },
   { name: 'Historical Painters' },
   { name: 'Historical Open' },
   { name: 'Fantasy/Sci-Fi Painters' },
   { name: 'Fantasy/Sci-Fi Open' },
   { name: 'Flats' },
   { name: 'Wargame' },
-  { name: 'Ordnance', classes: ['Ordnance Armor Military Vehicles', 'Maritime Ships', 'Aircraft', 'Civilian Vehicles'] },
+  { name: 'Ordnance', classes: ['Ordnance/Armor/Military Vehicles', 'Maritime/Ships', 'Aircraft', 'Civilian Vehicles'] },
   { name: 'Gundam Painters' },
   { name: 'Gundam Open' },
   { name: 'Diorama' }
