@@ -19,17 +19,17 @@ const AWARD_OPTIONS = [
 ];
 
 const DEFAULT_CATEGORIES = [
-  { name: 'Junior (under 18 years only)'},
-  { name: 'Historical Painters'},
-  { name: 'Historical Open'},
-  { name: 'Fantasy/Sci-Fi Painters'},
-  { name: 'Fantasy/Sci-Fi Open'},
-  { name: 'Flats'},
-  { name: 'Wargame'},
-  { name: 'Ordnance', classes: [Ordnance/Armor/Military Vehicles, Maritime/Ships, Aircraft, Civilian Vehicles] },
-  { name: 'Gundam Painters'},
-  { name: 'Gundam Open'},
-  { name: 'Diorama'},
+ { name: 'Junior (under 18 years only)' },
+  { name: 'Historical Painters' },
+  { name: 'Historical Open' },
+  { name: 'Fantasy/Sci-Fi Painters' },
+  { name: 'Fantasy/Sci-Fi Open' },
+  { name: 'Flats' },
+  { name: 'Wargame' },
+  { name: 'Ordnance', classes: ['Ordnance Armor Military Vehicles', 'Maritime Ships', 'Aircraft', 'Civilian Vehicles'] },
+  { name: 'Gundam Painters' },
+  { name: 'Gundam Open' },
+  { name: 'Diorama' }
 ];
 
 function uid(prefix = 'id') {
@@ -538,7 +538,7 @@ function DeskView({ config, entries, onCheckIn, onWalkIn, notify }) {
   const handleScan = (text) => {
     setScanning(false);
     const number = parseEntryQr(text);
-    if (number == null) { notify("That code isn't a ShowBench entry.", 'error'); return; }
+    if (number == null) { notify("That code isn't a BrushScore entry.", 'error'); return; }
     const found = entries.find((e) => e.number === number);
     if (!found) { notify(`No entry found for #${number}.`, 'error'); return; }
     onCheckIn(found.id, true);
@@ -625,7 +625,7 @@ function JudgeView({ config, entries, onAward, notify }) {
   const handleScan = (text) => {
     setScanning(false);
     const number = parseEntryQr(text);
-    if (number == null) { notify("That code isn't a ShowBench entry.", 'error'); return; }
+    if (number == null) { notify("That code isn't a BrushScore entry.", 'error'); return; }
     const found = entries.find((en) => en.number === number);
     if (!found) { notify(`No entry found for #${number}.`, 'error'); return; }
     jumpToEntry(found);
