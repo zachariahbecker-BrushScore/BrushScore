@@ -19,17 +19,17 @@ const AWARD_OPTIONS = [
 ];
 
 const DEFAULT_CATEGORIES = [
-  { name: 'Junior (under 18 years only)' },
-  { name: 'Historical Painters' },
-  { name: 'Historical Open' },
-  { name: 'Fantasy/Sci-Fi Painters' },
-  { name: 'Fantasy/Sci-Fi Open' },
-  { name: 'Flats' },
-  { name: 'Wargame' },
+  { name: 'Junior (under 18 years only)', classes: [] },
+  { name: 'Historical Painters', classes: [] },
+  { name: 'Historical Open', classes: [] },
+  { name: 'Fantasy/Sci-Fi Painters', classes: [] },
+  { name: 'Fantasy/Sci-Fi Open', classes: [] },
+  { name: 'Flats', classes: [] },
+  { name: 'Wargame', classes: [] },
   { name: 'Ordnance', classes: ['Ordnance/Armor/Military Vehicles', 'Maritime/Ships', 'Aircraft', 'Civilian Vehicles'] },
-  { name: 'Gundam Painters' },
-  { name: 'Gundam Open' },
-  { name: 'Diorama' }
+  { name: 'Gundam Painters', classes: [] },
+  { name: 'Gundam Open', classes: [] },
+  { name: 'Diorama', classes: [] }
 ];
 
 function uid(prefix = 'id') {
@@ -358,7 +358,7 @@ function SetupWizard({ initial, onSave, onCancel, isEdit }) {
       date,
       location: location.trim(),
       adminPin: adminPin.trim(),
-      categories: categories.filter((c) => c.name.trim()).map((c) => ({ ...c, name: c.name.trim(), classes: c.classes.filter(Boolean) })),
+      categories: categories.filter((c) => c.name.trim()).map((c) => ({ ...c, name: c.name.trim(), classes: (c.classes || []).filter(Boolean) })),
       status: initial?.status || 'open',
       nextEntryNumber: initial?.nextEntryNumber || 1,
     });
@@ -399,7 +399,7 @@ function SetupWizard({ initial, onSave, onCancel, isEdit }) {
             <div className="flex gap-2 items-start">
               <div className="flex-1 space-y-2">
                 <input value={c.name} onChange={(e) => updateCat(idx, 'name', e.target.value)} className="sb-input" placeholder="Category name (e.g. Armor &amp; Military Vehicles)" />
-                <input value={c.classes.join(', ')} onChange={(e) => updateClasses(idx, e.target.value)} className="sb-input text-sm" placeholder="Classes, comma separated (e.g. 1/72, 1/48, 1/35)" />
+                <input value={(c.classes || []).join(', ')} onChange={(e) => updateClasses(idx, e.target.value)} className="sb-input text-sm" placeholder="Classes, comma separated (e.g. 1/72, 1/48, 1/35)" />
               </div>
               <button onClick={() => removeCat(idx)} aria-label="Remove category" className="p-2 text-slate-400 hover:text-red-600">
                 <Trash2 size={16} />
@@ -439,8 +439,8 @@ function RegisterView({ config, onSubmit }) {
   const category = config.categories.find((c) => c.id === form.categoryId);
 
   useEffect(() => {
-    if (category && !category.classes.includes(form.className)) {
-      setForm((f) => ({ ...f, className: category.classes[0] || '' }));
+    if (category && !(category.classes || []).includes(form.className)) {
+      setForm((f) => ({ ...f, className: (category.classes || [])[0] || '' }));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [form.categoryId]);
