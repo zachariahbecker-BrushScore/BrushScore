@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   UserPlus, ClipboardCheck, ListChecks, Settings, Trophy, ArrowLeft,
   Search, Plus, Trash2, Check, Lock, Edit2, Save, Loader2, BarChart3, Users,
-  QrCode, X,
+  QrCode, X, Copy,
 } from 'lucide-react';
 
 /* ---------------------------------- data ---------------------------------- */
@@ -684,6 +684,31 @@ function StatCard({ label, value }) {
   );
 }
 
+function CopyLinkRow({ label, view }) {
+  const [copied, setCopied] = useState(false);
+  const url = `${window.location.origin}${window.location.pathname}?view=${view}`;
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(url);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1800);
+    } catch {
+      // clipboard API unavailable — the URL is still visible to copy manually
+    }
+  };
+  return (
+    <div className="flex items-center gap-2 bg-white border border-slate-200 rounded-lg px-3 py-2">
+      <div className="flex-1 min-w-0">
+        <p className="text-xs font-semibold text-slate-500">{label}</p>
+        <p className="sb-mono text-xs text-slate-800 truncate">{url}</p>
+      </div>
+      <button onClick={copy} className="shrink-0 flex items-center gap-1.5 text-xs font-semibold text-teal-700 hover:text-teal-800 px-2.5 py-1.5 rounded-md border border-teal-200 hover:bg-teal-50">
+        {copied ? <Check size={13} /> : <Copy size={13} />} {copied ? 'Copied' : 'Copy'}
+      </button>
+    </div>
+  );
+}
+
 function OverviewTab({ config, entries, onPublishToggle }) {
   const total = entries.length;
   const checkedIn = entries.filter((e) => e.checkedIn).length;
@@ -710,6 +735,16 @@ function OverviewTab({ config, entries, onPublishToggle }) {
               <span className="w-6 text-right text-slate-500 sb-mono text-xs">{c.count}</span>
             </div>
           ))}
+        </div>
+      </div>
+      <div className="border-t border-slate-200 pt-5">
+        <h3 className="font-semibold text-slate-800 mb-1 text-sm">Shareable links</h3>
+        <p className="text-xs text-slate-500 mb-3">
+          Send registrants straight to the registration form, and judges straight to Judging — no need to click through the home screen.
+        </p>
+        <div className="space-y-2">
+          <CopyLinkRow label="Registration link" view="register" />
+          <CopyLinkRow label="Judging link" view="judge" />
         </div>
       </div>
       <div className="border-t border-slate-200 pt-5">
@@ -900,6 +935,17 @@ function ResultsView({ config, entries }) {
 
 /* ------------------------------------ app ------------------------------------ */
 
+const VALID_VIEWS = ['register', 'desk', 'judge', 'organizer', 'results'];
+
+function getViewFromUrl() {
+  try {
+    const v = new URLSearchParams(window.location.search).get('view');
+    return VALID_VIEWS.includes(v) ? v : 'landing';
+  } catch {
+    return 'landing';
+  }
+}
+
 function viewTitle(v) {
   return { register: 'Register', desk: 'Registration Desk', judge: 'Judging', organizer: 'Organizer Console', results: 'Results' }[v] || '';
 }
@@ -908,7 +954,7 @@ export default function App() {
   const [config, setConfig] = useState(null);
   const [entries, setEntries] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [view, setView] = useState('landing');
+  const [view, setView] = useState(getViewFromUrl);
   const [unlocked, setUnlocked] = useState({ desk: false, judge: false, organizer: false });
   const [toast, setToast] = useState(null);
 
@@ -986,7 +1032,13 @@ export default function App() {
     notify(newStatus === 'published' ? 'Results published!' : 'Results unpublished.');
   };
 
-  const nav = (v) => setView(v);
+  const nav = (v) => {
+    setView(v);
+    const url = new URL(window.location.href);
+    if (v === 'landing') url.searchParams.delete('view');
+    else url.searchParams.set('view', v);
+    window.history.replaceState({}, '', url);
+  };
 
   if (loading) {
     return (
