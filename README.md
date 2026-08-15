@@ -75,7 +75,7 @@ login security — anyone with your site's URL and dev tools could read the
 underlying data. Fine for a club show; if that ever matters more, Supabase
 has built-in auth you could wire in later.
 * Data model is intentionally simple: one row for show config, one row for
-the full entries list, both in the `BrushScore\_kv` table. That's plenty for
+the full entries list, both in the `brushscore_kv` table. That's plenty for
 a single event; if you want multiple shows running independently, give
 each its own set of keys (e.g. prefix them per show) or its own project.
 * No offline support — it needs a network connection to read/write.

@@ -4,7 +4,7 @@
 // window.storage as before.
 import { supabase } from './supabaseClient';
 
-const TABLE = 'BrushScore_kv';
+const TABLE = 'brushscore_kv';
 
 async function get(key, _shared) {
   const { data, error } = await supabase.from(TABLE).select('value').eq('key', key).maybeSingle();

@@ -915,8 +915,8 @@ export default function App() {
   const notify = (msg, type = 'ok') => { setToast({ msg, type }); setTimeout(() => setToast(null), 2400); };
 
   const refresh = useCallback(async () => {
-    const cfgRaw = await safeGet('showbench:config', true);
-    const entRaw = await safeGet('showbench:entries', true);
+    const cfgRaw = await safeGet('brushscore:config', true);
+    const entRaw = await safeGet('brushscore:entries', true);
     setConfig(cfgRaw ? JSON.parse(cfgRaw) : null);
     setEntries(entRaw ? JSON.parse(entRaw) : []);
     setLoading(false);
@@ -926,19 +926,19 @@ export default function App() {
 
   const saveConfigNow = async (cfg) => {
     setConfig(cfg);
-    try { await window.storage.set('showbench:config', JSON.stringify(cfg), true); }
+    try { await window.storage.set('brushscore:config', JSON.stringify(cfg), true); }
     catch (e) { notify('Could not save settings.', 'error'); }
   };
 
   const saveEntriesNow = async (list) => {
     setEntries(list);
-    try { await window.storage.set('showbench:entries', JSON.stringify(list), true); }
+    try { await window.storage.set('brushscore:entries', JSON.stringify(list), true); }
     catch (e) { notify('Could not save — try again.', 'error'); }
   };
 
   const addEntry = async (form, isWalkIn = false) => {
-    const cfgRaw = await safeGet('showbench:config', true);
-    const entRaw = await safeGet('showbench:entries', true);
+    const cfgRaw = await safeGet('brushscore:config', true);
+    const entRaw = await safeGet('brushscore:entries', true);
     const latestConfig = cfgRaw ? JSON.parse(cfgRaw) : config;
     const latestEntries = entRaw ? JSON.parse(entRaw) : entries;
     const number = latestConfig.nextEntryNumber || latestEntries.length + 1;
