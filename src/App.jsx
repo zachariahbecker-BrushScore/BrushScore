@@ -197,6 +197,26 @@ function GlobalStyles() {
         .printdoc table { width: 100%; border-collapse: collapse; font-size: 9.5pt; margin-bottom: 4pt; }
         .printdoc th { text-align: left; border-bottom: 1pt solid #000; padding: 4pt 6pt; font-family: 'JetBrains Mono', monospace; font-size: 8pt; text-transform: uppercase; letter-spacing: .08em; }
         .printdoc td { padding: 4pt 6pt; border-bottom: 0.5pt solid #ccc; vertical-align: top; }
+
+        /* full-page table sign: legible from a few feet away, meant to
+           stand alone on an easel or lie flat on the registration table.
+           Deliberately does NOT rely on a fixed height + flex centering to
+           vertically center the content — that combination is inconsistent
+           across print engines and risks silently overflowing onto a
+           near-blank second page. Generous padding does the same visual
+           job without that risk. */
+        .regsign {
+          color: #000; box-sizing: border-box;
+          border: 3pt solid #000; padding: 0.85in 0.6in;
+          text-align: center;
+        }
+        .regsign .eyebrow { font-family: 'JetBrains Mono', monospace; font-size: 13pt; letter-spacing: .2em; text-transform: uppercase; color: #444; margin-bottom: 0.16in; }
+        .regsign h1 { font-family: 'Oswald', sans-serif; font-size: 40pt; font-weight: 700; line-height: 1.08; margin: 0 0 0.4in; }
+        .regsign .qrwrap { border: 2pt solid #000; padding: 0.18in; display: inline-block; margin-bottom: 0.3in; }
+        .regsign .urltext { font-family: 'JetBrains Mono', monospace; font-size: 13pt; word-break: break-all; max-width: 5.6in; margin: 0 auto 0.5in; }
+        .regsign ol { text-align: left; max-width: 5.2in; margin: 0 auto; font-size: 15pt; line-height: 1.55; padding-left: 0.3in; }
+        .regsign ol li { margin-bottom: 0.16in; }
+        .regsign .foot { font-family: 'JetBrains Mono', monospace; font-size: 10.5pt; letter-spacing: .1em; text-transform: uppercase; color: #444; margin-top: 0.5in; }
       }
     `}</style>
   );
@@ -1269,13 +1289,16 @@ function AwardsTab({ config, entries, onAssign }) {
   );
 }
 
-function PrintTab({ onPrintAllTags, onPrintResults, onPrintRules }) {
+function PrintTab({ onPrintAllTags, onPrintResults, onPrintRules, onPrintSign }) {
   return (
     <div className="space-y-3">
       <p className="text-sm text-slate-500 mb-2">
         Entry tags print two to a Letter sheet with a QR code, the model title, category, and the
         entrant's notes in a full-height box.
       </p>
+      <button onClick={onPrintSign} className="w-full flex items-center justify-center gap-2 bg-amber-500 hover:bg-amber-400 text-slate-900 rounded-lg py-2.5 font-semibold">
+        <Printer size={16} /> Print registration sign
+      </button>
       <button onClick={onPrintAllTags} className="w-full flex items-center justify-center gap-2 bg-slate-900 text-white rounded-lg py-2.5 font-semibold">
         <Printer size={16} /> Print tags — all entries
       </button>
@@ -1286,6 +1309,8 @@ function PrintTab({ onPrintAllTags, onPrintResults, onPrintRules }) {
         <Printer size={16} /> Print judging rules
       </button>
       <p className="text-xs text-slate-400">
+        The registration sign carries a QR straight to this show's registration form — it reads the
+        current address itself, so it stays correct even before you've set up a custom domain.
         Individual tags can also be printed from the Registration Desk, and a registrant can print their own right
         after they submit.
       </p>
@@ -1293,7 +1318,7 @@ function PrintTab({ onPrintAllTags, onPrintResults, onPrintRules }) {
   );
 }
 
-function OrganizerView({ config, entries, onUpdateConfig, onUpdateEntry, onDeleteEntry, onPublishToggle, onAssignAward, onPrintAllTags, onPrintResults, onPrintRules, onSyncCategories, categorySyncing }) {
+function OrganizerView({ config, entries, onUpdateConfig, onUpdateEntry, onDeleteEntry, onPublishToggle, onAssignAward, onPrintAllTags, onPrintResults, onPrintRules, onPrintSign, onSyncCategories, categorySyncing }) {
   const [tab, setTab] = useState('overview');
   const [editingSettings, setEditingSettings] = useState(false);
 
@@ -1323,7 +1348,7 @@ function OrganizerView({ config, entries, onUpdateConfig, onUpdateEntry, onDelet
       {tab === 'overview' && <OverviewTab config={config} entries={entries} onPublishToggle={onPublishToggle} />}
       {tab === 'entries' && <EntriesTab config={config} entries={entries} onUpdateEntry={onUpdateEntry} onDeleteEntry={onDeleteEntry} />}
       {tab === 'awards' && <AwardsTab config={config} entries={entries} onAssign={onAssignAward} />}
-      {tab === 'print' && <PrintTab onPrintAllTags={onPrintAllTags} onPrintResults={onPrintResults} onPrintRules={onPrintRules} />}
+      {tab === 'print' && <PrintTab onPrintAllTags={onPrintAllTags} onPrintResults={onPrintResults} onPrintRules={onPrintRules} onPrintSign={onPrintSign} />}
       {tab === 'settings' && (
         editingSettings ? (
           <SetupWizard
@@ -1508,6 +1533,27 @@ function ResultsSheet({ config, entries }) {
   );
 }
 
+function RegistrationSign({ config }) {
+  const url = `${window.location.origin}${window.location.pathname}?view=register`;
+  return (
+    <div className="regsign">
+      <div className="eyebrow">{config.name}</div>
+      <h1>Register Your Model</h1>
+      <div className="qrwrap">
+        <QrCode value={url} size={250} />
+      </div>
+      <div className="urltext">{url}</div>
+      <ol>
+        <li>Scan the code above, or type the address into any browser.</li>
+        <li>Fill in your name, the model's title, category, and a few notes — judges read them.</li>
+        <li>Submit. You'll get an entry number and a QR code of your own.</li>
+        <li>Print your tag on the spot, or ask desk staff to print it for you.</li>
+      </ol>
+      <div className="foot">No account needed &middot; Ask at the desk if you'd rather we register you</div>
+    </div>
+  );
+}
+
 function RulesSheet({ config }) {
   return (
     <div className="printdoc">
@@ -1581,6 +1627,7 @@ function PrintLayer({ job, config, entries }) {
   }
   if (job.type === 'results') return <div className="print-only"><ResultsSheet config={config} entries={entries} /></div>;
   if (job.type === 'rules') return <div className="print-only"><RulesSheet config={config} /></div>;
+  if (job.type === 'sign') return <div className="print-only"><RegistrationSign config={config} /></div>;
   return <div className="print-only" />;
 }
 
@@ -1746,6 +1793,7 @@ export default function App() {
   };
   const printResultsSheet = () => setPrintJob({ type: 'results' });
   const printRulesSheet = () => setPrintJob({ type: 'rules' });
+  const printRegistrationSign = () => setPrintJob({ type: 'sign' });
 
   const nav = (v) => {
     setView(v);
@@ -1807,6 +1855,7 @@ export default function App() {
               onPrintAllTags={() => printTags(entries)}
               onPrintResults={printResultsSheet}
               onPrintRules={printRulesSheet}
+              onPrintSign={printRegistrationSign}
               onSyncCategories={syncCategories}
               categorySyncing={categorySyncing}
             />
