@@ -44,27 +44,33 @@ function normalizeEntry(e) {
     ...e,
   };
 }
+// Adds any DEFAULT_CATEGORIES name missing from an existing list. Pure and
+// additive only — never renames, reorders, or removes anything already
+// there. Shared by normalizeConfig (runs automatically on load) and the
+// manual "Restore missing categories" action in Organizer → Settings, so
+// there's exactly one place this logic lives.
+function mergeDefaultCategories(categories) {
+  const list = categories || [];
+  const existingNames = new Set(list.map((cat) => cat.name));
+  const missing = DEFAULT_CATEGORIES
+    .filter((n) => !existingNames.has(n))
+    .map((n) => ({ id: uid('cat'), name: n }));
+  return { categories: missing.length ? [...list, ...missing] : list, added: missing.length };
+}
+
 function normalizeConfig(c) {
   if (!c) return c;
-  const categories = c.categories && c.categories.length
-    ? c.categories
-    : DEFAULT_CATEGORIES.map((n) => ({ id: uid('cat'), name: n }));
   // A show configured before the default category list changed keeps
   // whatever it already had — DEFAULT_CATEGORIES only seeds a brand new
   // show, it never rewrites one that already exists. So if the list has
   // moved on since (the Ordnance subdivisions, say), an existing show
-  // won't pick that up on its own. Add whichever default names are
-  // missing here instead of requiring a manual Settings edit every time.
-  // Categories the organizer renamed, reordered, or added themselves are
-  // left exactly as they are — this only ever adds, never replaces.
-  const existingNames = new Set(categories.map((cat) => cat.name));
-  const missing = DEFAULT_CATEGORIES
-    .filter((n) => !existingNames.has(n))
-    .map((n) => ({ id: uid('cat'), name: n }));
+  // won't pick that up on its own; mergeDefaultCategories adds whichever
+  // default names are missing instead of requiring a manual Settings edit.
+  const { categories } = mergeDefaultCategories(c.categories);
   return {
     judgeCount: 3, headJudgeSlot: 1, showTheme: DEFAULT_SHOW_THEME, specialAwards: {},
     ...c,
-    categories: missing.length ? [...categories, ...missing] : categories,
+    categories,
   };
 }
 
@@ -1284,7 +1290,7 @@ function PrintTab({ onPrintAllTags, onPrintResults, onPrintRules }) {
   );
 }
 
-function OrganizerView({ config, entries, onUpdateConfig, onUpdateEntry, onDeleteEntry, onPublishToggle, onAssignAward, onPrintAllTags, onPrintResults, onPrintRules }) {
+function OrganizerView({ config, entries, onUpdateConfig, onUpdateEntry, onDeleteEntry, onPublishToggle, onAssignAward, onPrintAllTags, onPrintResults, onPrintRules, onSyncCategories, categorySyncing }) {
   const [tab, setTab] = useState('overview');
   const [editingSettings, setEditingSettings] = useState(false);
 
@@ -1324,11 +1330,26 @@ function OrganizerView({ config, entries, onUpdateConfig, onUpdateEntry, onDelet
             onSave={async (cfg) => { await onUpdateConfig(cfg); setEditingSettings(false); }}
           />
         ) : (
-          <div className="bg-white border border-slate-200 rounded-lg p-4">
-            <p className="text-sm text-slate-600 mb-3">Edit show name, date, location, staff PIN, judging panel, and categories.</p>
-            <button onClick={() => setEditingSettings(true)} className="text-sm font-medium text-teal-700 flex items-center gap-1">
-              <Edit2 size={14} /> Edit show settings
-            </button>
+          <div className="bg-white border border-slate-200 rounded-lg p-4 space-y-4">
+            <div>
+              <p className="text-sm text-slate-600 mb-3">Edit show name, date, location, staff PIN, judging panel, and categories.</p>
+              <button onClick={() => setEditingSettings(true)} className="text-sm font-medium text-teal-700 flex items-center gap-1">
+                <Edit2 size={14} /> Edit show settings
+              </button>
+            </div>
+            <div className="border-t border-slate-100 pt-4">
+              <p className="text-xs font-semibold text-slate-500 mb-1">
+                Category list ({config.categories.length})
+              </p>
+              <p className="text-xs text-slate-500 mb-2">{config.categories.map((c) => c.name).join(' · ')}</p>
+              <button onClick={onSyncCategories} disabled={categorySyncing} className="text-sm font-medium text-teal-700 disabled:opacity-40 flex items-center gap-1">
+                {categorySyncing ? <Loader2 size={14} className="animate-spin" /> : <Plus size={14} />}
+                {categorySyncing ? 'Restoring…' : 'Restore any missing default categories'}
+              </button>
+              <p className="text-xs text-slate-400 mt-1">
+                Only ever adds — never renames or removes anything already in your list.
+              </p>
+            </div>
           </div>
         )
       )}
@@ -1691,6 +1712,31 @@ export default function App() {
     notify(newStatus === 'published' ? 'Results published!' : 'Results unpublished.');
   };
 
+  // Guards syncCategories against overlapping runs. saveConfigNow updates
+  // the UI immediately but persists to storage a tick later — a second
+  // click before that write lands would read the old storage state and
+  // silently race the first click's save. Ignoring calls while one is
+  // already in flight closes that window entirely.
+  const [categorySyncing, setCategorySyncing] = useState(false);
+  const syncCategories = async () => {
+    if (categorySyncing) return;
+    setCategorySyncing(true);
+    try {
+      const cfgRaw = await safeGet('brushscore:config', true);
+      const raw = cfgRaw ? JSON.parse(cfgRaw) : config;
+      if (!raw) return;
+      const { categories, added } = mergeDefaultCategories(raw.categories);
+      await saveConfigNow(normalizeConfig({ ...raw, categories }));
+      notify(
+        added > 0
+          ? `Added ${added} categor${added === 1 ? 'y' : 'ies'} — refresh the register form to see it.`
+          : 'Every default category is already in your list.'
+      );
+    } finally {
+      setCategorySyncing(false);
+    }
+  };
+
   const printTags = (list) => {
     if (!list.length) { notify('Nothing selected to print.', 'error'); return; }
     setPrintJob({ type: 'tags', entries: list });
@@ -1758,6 +1804,8 @@ export default function App() {
               onPrintAllTags={() => printTags(entries)}
               onPrintResults={printResultsSheet}
               onPrintRules={printRulesSheet}
+              onSyncCategories={syncCategories}
+              categorySyncing={categorySyncing}
             />
           </PinGate>
         )}

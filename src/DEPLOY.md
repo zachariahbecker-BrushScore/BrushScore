@@ -118,12 +118,15 @@ Open `http://localhost:5173` and go through this in order:
    and confirm your own name is *not* on it. Tags carry the model and
    category only now, on purpose.
 2b. **Existing show, if you have one.** Refresh the app once and check
-    Organizer → Settings → category list (or just the Category dropdown
-    on the register form) for the four Ordnance subdivisions —
+    Organizer → Settings — it now shows your category count and full list
+    right there — for the four Ordnance subdivisions:
     Ordnance/Armor/Military Vehicles, Maritime/Ships, Aircraft, Civilian
-    Vehicles. They should appear automatically on this first load without
-    you adding them by hand; if they don't, something's off and worth
-    reporting back rather than adding them manually as a workaround.
+    Vehicles. They should appear automatically on this first load. If they
+    don't, click **Restore any missing default categories** right below
+    that list — same fix, on demand, useful if this tab was already open
+    before you deployed. Either way, don't add them by hand as a
+    workaround; if the button doesn't bring them back either, that's
+    worth reporting rather than working around.
 3. **Registration Desk.** Confirm each row has a small print icon, and
    that you can select several entries and print them as a batch.
 4. **Judging.** Unlock with your staff PIN. Confirm a row of judge-slot

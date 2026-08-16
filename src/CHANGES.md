@@ -109,6 +109,26 @@ Practically: deploy this update, open the app once, and the Ordnance
 categories (and anything else the default list has picked up since your
 show was configured) should just be there.
 
+**If they still don't appear**, there's now a second layer: Organizer →
+Settings shows the exact category list your show currently has (name and
+count, right there — no need to check Supabase directly), and a
+**Restore any missing default categories** button that runs the same
+check on demand, reading whatever's actually saved at that moment rather
+than trusting this browser tab's memory of it. That second part matters
+if the tab was open before you deployed — its own copy of the category
+list wouldn't know about the update until it re-reads storage, and the
+button forces that re-read. Like the automatic version, it only ever
+adds; it can't rename or remove anything already there.
+
+One race got caught and closed while building this: clicking the button
+twice in quick succession — reasonable if nothing seemed to happen the
+first time — could have the second click read storage before the first
+click's save had finished landing, silently overwriting it with stale
+data. The button now ignores a second click while the first is still in
+flight (it disables itself and shows "Restoring…" briefly), so a
+double-click lands on the same correct result as a single one instead of
+racing itself.
+
 ## Update — printed tags no longer show the entrant's name
 
 Tags now carry only the model title, category, and notes — the entrant's
