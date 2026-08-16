@@ -13,6 +13,8 @@ import {
   DEFAULT_CATEGORIES, DEFAULT_SHOW_THEME,
   SPECIAL_AWARDS, AWARD_GROUPS, eligibleEntries,
 } from './awards';
+import brushscoreLogo from './assets/brushscore-logo.webp';
+import brushscoreIcon from './assets/brushscore-icon-transparent.webp';
 
 /* ---------------------------------- data ---------------------------------- */
 
@@ -239,7 +241,7 @@ function TopBar({ title, onBack }) {
         <ArrowLeft size={16} /> Home
       </button>
       <h2 className="sb-display text-sm tracking-wide">{title}</h2>
-      <div className="w-14" />
+      <img src={brushscoreIcon} alt="" className="w-9 h-auto shrink-0" />
     </div>
   );
 }
@@ -452,6 +454,7 @@ function Landing({ config, entries, onNav }) {
   return (
     <div className="sb-blueprint-bg">
       <div className="max-w-3xl mx-auto px-4 py-14 text-center">
+        <img src={brushscoreLogo} alt="BrushScore" className="mx-auto w-52 sm:w-60 mb-8 rounded-md shadow-sm" />
         <p className="sb-mono text-amber-600 text-xs tracking-widest mb-2">ENTRY №{pad(total + 1)} NEXT UP</p>
         <h1 className="sb-display text-4xl md:text-5xl text-slate-900 mb-2">{config.name}</h1>
         <p className="text-slate-600">{config.date}{config.location ? ` · ${config.location}` : ''}</p>
