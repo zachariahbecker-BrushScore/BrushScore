@@ -6,11 +6,11 @@ import {
 } from 'lucide-react';
 import { encodeQR } from './qrcode';
 import {
-  CRITERIA, PER_CRITERION_MAX, TIERS, LIMITS,
+  CRITERIA, TIERS, LIMITS,
   computeScore, fmt1, flagLabel, reconciliationText,
 } from './scoring';
 import {
-  DEFAULT_CATEGORIES, DIVISIONS, DEFAULT_SHOW_THEME,
+  DEFAULT_CATEGORIES, DEFAULT_SHOW_THEME,
   SPECIAL_AWARDS, AWARD_GROUPS, eligibleEntries,
 } from './awards';
 
@@ -37,7 +37,7 @@ async function safeGet(key, shared) {
    that are no longer used are simply ignored from here on. */
 function normalizeEntry(e) {
   return {
-    contact: '', division: 'Open', notes: '',
+    contact: '', notes: '',
     checkedIn: false, checkedInAt: null,
     scores: {}, headConfirm: null,
     registeredAt: null,
@@ -552,8 +552,10 @@ function SetupWizard({ initial, onSave, onCancel, isEdit }) {
         </button>
       </div>
       <p className="text-xs text-slate-500 mb-3">
-        Division (Open / Painters / Junior) is asked at registration for every category, so the Painters and Junior
-        category awards work no matter which of these a model is entered under.
+        Painters, Open, and Junior are separate category names here ("Historical Painters" vs "Historical Open") rather
+        than a division picked alongside the category — keep these names matching{' '}
+        <code className="sb-mono text-slate-600">src/awards.js</code> if you rename one, or its award loses its
+        eligible entries.
       </p>
       <div className="space-y-2 mb-6">
         {categories.map((c, idx) => (
@@ -587,7 +589,7 @@ function RegisterView({ config, onSubmit, onPrintTag }) {
   const firstCat = config.categories[0];
   const [form, setForm] = useState({
     name: '', contact: '', modelName: '',
-    categoryId: firstCat?.id || '', division: 'Open', notes: '',
+    categoryId: firstCat?.id || '', notes: '',
   });
   const [confirmed, setConfirmed] = useState(null);
   const [saving, setSaving] = useState(false);
@@ -650,11 +652,6 @@ function RegisterView({ config, onSubmit, onPrintTag }) {
       <Field label="Category">
         <select className="sb-input" value={form.categoryId} onChange={(e) => setForm((f) => ({ ...f, categoryId: e.target.value }))}>
           {config.categories.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
-        </select>
-      </Field>
-      <Field label="Division">
-        <select className="sb-input" value={form.division} onChange={(e) => setForm((f) => ({ ...f, division: e.target.value }))}>
-          {DIVISIONS.map((d) => <option key={d} value={d}>{d}</option>)}
         </select>
       </Field>
       <Field label="Notes — techniques, conversions, the subject">
@@ -747,7 +744,7 @@ function DeskView({ config, entries, onCheckIn, onWalkIn, onPrintTags, notify })
             <EntryBadge number={e.number} size="sm" />
             <div className="flex-1 min-w-0">
               <p className="font-medium text-slate-900 truncate">{e.modelName}</p>
-              <p className="text-xs text-slate-500 truncate">{e.name} · {categoryName(config, e.categoryId)} · {e.division}</p>
+              <p className="text-xs text-slate-500 truncate">{e.name} · {categoryName(config, e.categoryId)}</p>
             </div>
             <button onClick={() => onPrintTags([e])} aria-label="Print tag" className="shrink-0 p-2 text-slate-400 hover:text-slate-700">
               <Printer size={15} />
@@ -790,18 +787,21 @@ function CriterionInput({ crit, value, onChange }) {
   return (
     <div className="border-t border-slate-100 first:border-t-0 py-2">
       <div className="flex items-center justify-between gap-3">
-        <label className="text-sm text-slate-700">{crit.name}</label>
+        <label className="text-sm text-slate-700">
+          {crit.name} <span className="sb-mono text-xs text-slate-400">(0–{crit.max})</span>
+        </label>
         <input
           type="number"
           min={0}
-          max={PER_CRITERION_MAX}
+          max={crit.max}
           step={1}
           inputMode="numeric"
+          aria-label={`${crit.name}, 0 to ${crit.max} points`}
           className="sb-input sb-mono text-center w-20 py-1 shrink-0"
           value={value ?? ''}
           onChange={(e) => {
             const raw = e.target.value;
-            const v = raw === '' ? null : Math.max(0, Math.min(PER_CRITERION_MAX, Math.round(Number(raw))));
+            const v = raw === '' ? null : Math.max(0, Math.min(crit.max, Math.round(Number(raw))));
             onChange(v);
           }}
         />
@@ -870,7 +870,9 @@ function JudgeEntryCard({ entry, config, mySlot, onScore, onHeadConfirm, categor
           )}
 
           <div className="mt-3">
-            <p className="text-xs font-semibold text-slate-500 mb-1">Your marks — Judge {mySlot}</p>
+            <p className="text-xs font-semibold text-slate-500 mb-1">
+              Your marks — Judge {mySlot} <span className="font-normal text-slate-400">(points per line add up to 100)</span>
+            </p>
             {CRITERIA.map((c) => (
               <CriterionInput key={c.key} crit={c} value={myMarks[c.key]} onChange={(v) => setMark(c.key, v)} />
             ))}
@@ -968,7 +970,7 @@ function JudgeView({ config, entries, onScore, onHeadConfirm, notify }) {
             mySlot={mySlot}
             onScore={onScore}
             onHeadConfirm={onHeadConfirm}
-            categoryLabel={`${categoryName(config, e.categoryId)} · ${e.division}`}
+            categoryLabel={categoryName(config, e.categoryId)}
             forceOpen={highlight === e.id}
           />
         ))}
@@ -1101,9 +1103,6 @@ function EntriesTab({ config, entries, onUpdateEntry, onDeleteEntry }) {
               <select className="sb-input text-xs w-40" value={e.categoryId} onChange={(ev) => onUpdateEntry(e.id, { categoryId: ev.target.value })}>
                 {config.categories.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
               </select>
-              <select className="sb-input text-xs w-28" value={e.division} onChange={(ev) => onUpdateEntry(e.id, { division: ev.target.value })}>
-                {DIVISIONS.map((d) => <option key={d} value={d}>{d}</option>)}
-              </select>
               <button onClick={() => onDeleteEntry(e.id)} aria-label="Delete entry" className="p-2 text-slate-400 hover:text-red-600">
                 <Trash2 size={15} />
               </button>
@@ -1155,7 +1154,7 @@ function TierSummary({ config, entries }) {
 
 function AwardRow({ award, config, entries, onAssign }) {
   const [showAll, setShowAll] = useState(false);
-  const pool = showAll ? entries : eligibleEntries(award, entries);
+  const pool = showAll ? entries : eligibleEntries(award, entries, config);
   const current = config.specialAwards?.[award.id];
 
   if (award.multi) {
@@ -1249,7 +1248,7 @@ function PrintTab({ onPrintAllTags, onPrintResults, onPrintRules }) {
   return (
     <div className="space-y-3">
       <p className="text-sm text-slate-500 mb-2">
-        Entry tags print two to a Letter sheet with a QR code, the model title, category, division, and the
+        Entry tags print two to a Letter sheet with a QR code, the model title, category, and the
         entrant's notes in a full-height box.
       </p>
       <button onClick={onPrintAllTags} className="w-full flex items-center justify-center gap-2 bg-slate-900 text-white rounded-lg py-2.5 font-semibold">
@@ -1415,7 +1414,6 @@ function TagCard({ entry, config }) {
       <div className="tag-title">{entry.modelName}</div>
       <div className="tag-meta">
         <span>{categoryName(config, entry.categoryId)}</span>
-        <span>{entry.division}</span>
         <span>{entry.name}</span>
       </div>
       <div className="tag-notes">
@@ -1456,12 +1454,12 @@ function ResultsSheet({ config, entries }) {
       </table>
       <h2>Scores</h2>
       <table>
-        <thead><tr><th>No.</th><th>Model</th><th>Entrant</th><th>Category</th><th>Division</th><th>Score</th><th>Tier</th></tr></thead>
+        <thead><tr><th>No.</th><th>Model</th><th>Entrant</th><th>Category</th><th>Score</th><th>Tier</th></tr></thead>
         <tbody>
           {rows.map(({ e, r }) => (
             <tr key={e.id}>
               <td>{e.number}</td><td>{e.modelName}</td><td>{e.name}</td>
-              <td>{categoryName(config, e.categoryId)}</td><td>{e.division}</td>
+              <td>{categoryName(config, e.categoryId)}</td>
               <td>{r.score ?? '—'}</td><td>{r.finalTier ? r.finalTier.name : '—'}</td>
             </tr>
           ))}
@@ -1477,9 +1475,12 @@ function RulesSheet({ config }) {
       <h1>Judging rules — {config.name}</h1>
       <h2>The rubric</h2>
       <p>
-        Every judge scores every entry independently on the same three criteria, 0 to 100 on each: Technical ability,
-        Composition, and Difficulty. The three criteria carry equal weight. Judges do not compare notes before
-        scoring, and do not see each other's marks until their own are in.
+        Every judge scores every entry independently on the same three criteria, each with its own share of 100
+        points: Technical ability (0–{CRITERIA.find((c) => c.key === 'technical').max}), Composition
+        (0–{CRITERIA.find((c) => c.key === 'composition').max}), and Difficulty
+        (0–{CRITERIA.find((c) => c.key === 'difficulty').max}). A judge's score for an entry is the sum of their
+        three marks, which lands between 0 and 100 on its own since those three maxes add up to 100. Judges do not
+        compare notes before scoring, and do not see each other's marks until their own are in.
       </p>
       <h2>From marks to a tier</h2>
       <p>
@@ -1613,7 +1614,7 @@ export default function App() {
     const entry = normalizeEntry({
       id: uid('entry'), number,
       name: form.name.trim(), contact: (form.contact || '').trim(),
-      modelName: form.modelName.trim(), categoryId: form.categoryId, division: form.division || 'Open',
+      modelName: form.modelName.trim(), categoryId: form.categoryId,
       notes: (form.notes || '').trim(),
       checkedIn: isWalkIn, checkedInAt: isWalkIn ? new Date().toISOString() : null,
       registeredAt: new Date().toISOString(),

@@ -106,33 +106,40 @@ Open `http://localhost:5173` and go through this in order:
    Organizer → Settings → Edit show settings. Either way, confirm the new
    **Judging panel** section is there — Judges per entry (2 or 3) and
    Head judge — and a **Show theme** field. Set them for your show.
-2. **Register a test entry.** Confirm the form now asks for **Division**
-   (Open / Painters / Junior) in addition to Category. Submit it, and on
-   the confirmation screen confirm the QR renders instantly with no
-   network request — open your browser's dev tools Network tab first if
+2. **Register a test entry.** Confirm the Category dropdown lists the
+   full 14-name set — Junior, Historical Painters, Historical Open, and
+   so on — with no separate Division field alongside it (Painters, Open
+   and Junior are baked into the category names themselves now). Submit
+   it, and on the confirmation screen confirm the QR renders instantly
+   with no network request — open your browser's dev tools Network tab first if
    you want to see that nothing goes out to `api.qrserver.com` anymore.
    Click **Print my tag** and confirm a print preview opens with the QR,
-   title, category, division, and a notes box that's visibly bigger than
-   before.
+   title, category, and a notes box that's visibly bigger than before.
 3. **Registration Desk.** Confirm each row has a small print icon, and
    that you can select several entries and print them as a batch.
 4. **Judging.** Unlock with your staff PIN. Confirm a row of judge-slot
    buttons appears at the top ("I am — Judge 1 · Head, Judge 2, Judge 3").
-   Open your test entry, and as Judge 1 enter three marks (Technical
-   ability, Composition, Difficulty — 0 to 100 each). Confirm a score
-   meter and a tier chip appear. Switch to Judge 2, enter marks, then
-   Judge 3 if your panel is set to 3 — confirm the panel score is the
-   average of the three judge averages, rounded.
+   Open your test entry, and as Judge 1 enter three marks — Technical
+   ability (0–33), Composition (0–33), Difficulty (0–34), each field
+   capped at its own max, with the range printed right next to the
+   label. Confirm a score meter and a tier chip appear. Switch to
+   Judge 2, enter marks, then Judge 3 if your panel is set to 3 —
+   confirm the panel score is the average of the three judges' totals,
+   rounded.
    Test the two-judge path too: in Settings, switch Judges per entry to
-   2, come back, and score an entry with a wide split (like 90/90/90 for
-   one judge, 70/70/70 for the other) — confirm a **Reconcile** notice
-   appears. Then try two scores that land within 2 points of a tier
-   line (84/84/84 both judges, just under Gold's 86) — confirm a
-   **Head judge** notice appears, and that only the slot marked head in
-   Settings can click "Move up a tier."
+   2, come back, and score an entry with a wide split — something like
+   29/30/31 for one judge (a 90) and 23/23/24 for the other (a 70) —
+   confirm a **Reconcile** notice appears. Then try two scores landing
+   within 2 points of a tier line — 27/28/29 both judges (an 84, just
+   under Gold's 86) — confirm a **Head judge** notice appears, and that
+   only the slot marked head in Settings can click "Move up a tier."
 5. **Organizer → Awards.** Confirm all 27 named awards are listed, that
-   Best Junior's dropdown only offers Junior-division entries, and that
-   the Capital Palette award lets you add more than one recipient.
+   Best Junior's dropdown only offers entries registered under the
+   Junior category, that Best Historical Painters only offers Historical
+   Painters entries (not Historical Open), and that the Capital Palette
+   award lets you add more than one recipient. If any category-specific
+   dropdown comes up empty when it shouldn't, that's the eligibility bug
+   this update fixed — see CHANGES.md — so it's worth this specific check.
 6. **Organizer → Print.** Try each of the three buttons — all tags,
    results & awards sheet, judging rules — and confirm each opens a print
    preview without error.
@@ -146,36 +153,42 @@ icon) so it doesn't show up in your real show.
 
 ## Step 6 — Migrate existing entries (skip if nothing's registered yet)
 
-Two of the old fields don't carry over as cleanly as everything else, so
-if you already have real registrations, do this before you announce the
-update.
+One field doesn't carry over as cleanly as everything else, so if you
+already have real registrations, do this before you announce the update.
 
-**Categories.** The old category editor let you attach free-text classes
-to a category — that's how "Ordnance" held Armor, Maritime, Aircraft, and
-Civilian Vehicles as one category with four classes. The new award list
-needs those as independent categories so Best Maritime and Best Aircraft
-can each query their own pool. In Organizer → Settings, rename or split
-your categories to match:
+**Categories.** The category list is now this exact 14-name set — Division
+is gone, so Painters/Open/Junior live in the category name itself:
 
 ```
-Historical · Fantasy & Sci-Fi · Flat · Wargame · Ordnance · Maritime
-Aircraft · Civilian Vehicle · Gundam · Diorama · Bust
+Junior (under 18 years only)      Ordnance/Armor/Military Vehicles
+Historical Painters               Maritime/Ships
+Historical Open                   Aircraft
+Fantasy/Science Fiction Painters  Civilian Vehicles
+Fantasy/Science Fiction Open      Gundam Painters
+Flats                             Gundam Open
+Wargame                           Diorama
 ```
 
-You don't have to use these exact names or this exact set — the award
-filters just need the category name to match what's in `src/awards.js`
-for the category-specific awards to have anything to list. If you rename
-a category that already has entries, go to Organizer → Entries and
-reassign those entries to the new name.
+In Organizer → Settings, rename your existing categories to match these —
+you don't strictly have to use these exact names, but the 27 awards'
+eligibility filters in `src/awards.js` are written against this exact set,
+so a category that doesn't match one of these strings won't feed any
+award's dropdown. If you rename a category that already has entries, go to
+Organizer → Entries afterward and reassign those entries to the new name —
+renaming the category in Settings doesn't retroactively touch entries
+already filed under the old name.
 
-**Division.** Every existing entry loads with Division defaulted to
-Open. If some of those were really Painters or Junior entries under the
-old scheme, go to Organizer → Entries and set Division on each — that
-dropdown is right there in the row alongside Category.
+If your existing categories used a Division field (Open/Painters/Junior)
+alongside a plain category name, that field is gone from the entry form
+now — there's nothing to migrate for it specifically, since the category
+rename above is what replaces it. An entry that was "Historical" +
+division "Painters" just needs its category changed to "Historical
+Painters" directly.
 
-Neither of these needs to happen before you deploy — the app runs fine
-with everything defaulted to Open. It just means the Painters/Open/Junior
-awards won't have the right candidates until you do this pass.
+This doesn't need to happen before you deploy — the app runs fine with
+whatever category names are already there. It just means the category-
+specific awards won't have the right candidates in their dropdowns until
+you do this pass.
 
 ---
 

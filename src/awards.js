@@ -1,46 +1,55 @@
-// Category + division taxonomy, and the 27-award catalogue that filters
-// against it. Kept separate from App.jsx because both scoring and the
-// award-eligibility filters read from here.
-
+// Category taxonomy, and the 27-award catalogue that filters against it.
+// Kept separate from App.jsx because both scoring and the award-eligibility
+// filters read from here.
+//
+// Painters/Open and Junior are baked directly into the category names below
+// rather than tracked as a separate Division field — "Historical Painters"
+// and "Historical Open" are two distinct categories, not one category with
+// a division attached. Ordnance is deliberately not its own category: it's
+// split into the four subdivisions below, each a full category in its own
+// right, matching the four awards (Best Ordnance, Best Maritime, Best
+// Aircraft, Best Civilian Vehicle) that already existed for them.
 export const DEFAULT_CATEGORIES = [
-  'Historical',
-  'Fantasy & Sci-Fi',
-  'Flat',
+  'Junior (under 18 years only)',
+  'Historical Painters',
+  'Historical Open',
+  'Fantasy/Science Fiction Painters',
+  'Fantasy/Science Fiction Open',
+  'Flats',
   'Wargame',
-  'Ordnance',
-  'Maritime',
+  'Ordnance/Armor/Military Vehicles',
+  'Maritime/Ships',
   'Aircraft',
-  'Civilian Vehicle',
-  'Gundam',
+  'Civilian Vehicles',
+  'Gundam Painters',
+  'Gundam Open',
   'Diorama',
-  'Bust',
 ];
-
-// Division applies across every category. Only some awards filter on it
-// (Painters/Open splits for Historical, Fantasy & Sci-Fi and Gundam; Junior
-// applies everywhere).
-export const DIVISIONS = ['Open', 'Painters', 'Junior'];
 
 export const DEFAULT_SHOW_THEME = 'Celebrating 250 Years Since the Signing of the Declaration of Independence';
 
-// group: 'cat' (division/category), 'named' (subject, panel discretion),
+// group: 'cat' (category), 'named' (subject, panel discretion),
 // 'show' (announced last). multi: true allows more than one recipient.
 export const SPECIAL_AWARDS = [
-  { id: 'best-junior', name: 'Best Junior', group: 'cat', filter: { division: 'Junior' } },
-  { id: 'best-hist-painters', name: 'Best Historical Painters', group: 'cat', filter: { category: 'Historical', division: 'Painters' } },
-  { id: 'best-hist-open', name: 'Best Historical Open', group: 'cat', filter: { category: 'Historical', division: 'Open' } },
-  { id: 'best-fsf-painters', name: 'Best Fantasy & Sci-Fi Painters', group: 'cat', filter: { category: 'Fantasy & Sci-Fi', division: 'Painters' } },
-  { id: 'best-fsf-open', name: 'Best Fantasy & Sci-Fi Open', group: 'cat', filter: { category: 'Fantasy & Sci-Fi', division: 'Open' } },
-  { id: 'best-flat', name: 'Best Flat', group: 'cat', filter: { category: 'Flat' } },
+  { id: 'best-junior', name: 'Best Junior', group: 'cat', filter: { category: 'Junior (under 18 years only)' } },
+  { id: 'best-hist-painters', name: 'Best Historical Painters', group: 'cat', filter: { category: 'Historical Painters' } },
+  { id: 'best-hist-open', name: 'Best Historical Open', group: 'cat', filter: { category: 'Historical Open' } },
+  { id: 'best-fsf-painters', name: 'Best Fantasy & Sci-Fi Painters', group: 'cat', filter: { category: 'Fantasy/Science Fiction Painters' } },
+  { id: 'best-fsf-open', name: 'Best Fantasy & Sci-Fi Open', group: 'cat', filter: { category: 'Fantasy/Science Fiction Open' } },
+  { id: 'best-flat', name: 'Best Flat', group: 'cat', filter: { category: 'Flats' } },
   { id: 'best-wargame', name: 'Best Wargame', group: 'cat', filter: { category: 'Wargame' } },
-  { id: 'best-ordnance', name: 'Best Ordnance', group: 'cat', filter: { category: 'Ordnance' } },
-  { id: 'best-maritime', name: 'Best Maritime', group: 'cat', filter: { category: 'Maritime' } },
+  { id: 'best-ordnance', name: 'Best Ordnance', group: 'cat', filter: { category: 'Ordnance/Armor/Military Vehicles' } },
+  { id: 'best-maritime', name: 'Best Maritime', group: 'cat', filter: { category: 'Maritime/Ships' } },
   { id: 'best-aircraft', name: 'Best Aircraft', group: 'cat', filter: { category: 'Aircraft' } },
-  { id: 'best-civilian-vehicle', name: 'Best Civilian Vehicle', group: 'cat', filter: { category: 'Civilian Vehicle' } },
-  { id: 'best-gundam-painters', name: 'Best Gundam Painters', group: 'cat', filter: { category: 'Gundam', division: 'Painters' } },
-  { id: 'best-gundam-open', name: 'Best Gundam Open', group: 'cat', filter: { category: 'Gundam', division: 'Open' } },
+  { id: 'best-civilian-vehicle', name: 'Best Civilian Vehicle', group: 'cat', filter: { category: 'Civilian Vehicles' } },
+  { id: 'best-gundam-painters', name: 'Best Gundam Painters', group: 'cat', filter: { category: 'Gundam Painters' } },
+  { id: 'best-gundam-open', name: 'Best Gundam Open', group: 'cat', filter: { category: 'Gundam Open' } },
   { id: 'best-diorama', name: 'Best Diorama', group: 'cat', filter: { category: 'Diorama' } },
-  { id: 'best-bust', name: 'Best Bust', group: 'cat', filter: { category: 'Bust' } },
+  // No Bust category in the current list, so this has nothing to filter on
+  // — moved to panel discretion like the other named awards rather than
+  // silently dropped. Remove it, or give it a category filter, if that's
+  // not what you want.
+  { id: 'best-bust', name: 'Best Bust', group: 'named' },
 
   { id: 'best-wwi-figure', name: 'Best World War I Figure', group: 'named' },
   { id: 'joe-bles-semper-fi', name: 'Joe Bles "Semper Fi" Award', group: 'named' },
@@ -58,16 +67,21 @@ export const SPECIAL_AWARDS = [
 ];
 
 export const AWARD_GROUPS = [
-  { key: 'cat', title: 'Division & category awards', note: 'One per line. Lists narrow to eligible entries; switch to the full field if the panel wants to reach outside it.' },
+  { key: 'cat', title: 'Category awards', note: 'One per line. Lists narrow to eligible entries; switch to the full field if the panel wants to reach outside it.' },
   { key: 'named', title: 'Subject & named awards', note: 'Panel discretion — any entry may be nominated regardless of category.' },
   { key: 'show', title: 'Show awards', note: 'Announced last.' },
 ];
 
-export function eligibleEntries(award, entries) {
-  if (!award.filter) return entries;
-  return entries.filter(
-    (e) =>
-      (!award.filter.category || e.categoryName === award.filter.category) &&
-      (!award.filter.division || e.division === award.filter.division)
-  );
+// Entries carry a categoryId, not a category name, so eligibility has to
+// resolve the name through the show's category list. (Earlier versions of
+// this function checked e.categoryName directly — a field nothing ever set,
+// which meant every category-specific award silently had zero eligible
+// entries unless "Show all entries" was ticked. Fixed by resolving the name
+// here instead of expecting the caller to have already attached it.)
+export function eligibleEntries(award, entries, config) {
+  if (!award.filter?.category) return entries;
+  return entries.filter((e) => {
+    const name = config?.categories?.find((c) => c.id === e.categoryId)?.name;
+    return name === award.filter.category;
+  });
 }

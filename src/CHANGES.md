@@ -12,12 +12,86 @@ src/awards.js    — new
 src/qrcode.js    — new
 ```
 
+## Update — weighted points per criterion, and a new category list
+
+Two changes on top of the original judging rewrite:
+
+**Each criterion now has its own point cap, shown right on the input.**
+Technical ability is 0–33, Composition is 0–33, Difficulty is 0–34 — those
+three add up to exactly 100, so a judge's score is now the *sum* of their
+three marks rather than an average of three 0–100 marks. The number input
+for each criterion is capped at its own max (typing over it clamps down),
+and the label shows the range inline: "Technical ability (0–33)." Nothing
+about the tier bands changed — 86/76/65/50 still mean the same thing,
+because the three maxes were chosen to sum to 100. If you want a different
+split (weighting Difficulty higher, say), the three `.max` values in
+`src/scoring.js` just need to keep summing to 100 — there's a comment
+right above them saying so.
+
+One thing recalibrated to match: the reconciliation threshold for "these
+two judges disagree enough on this specific criterion to discuss it" used
+to be 20 points on the old 0–100-per-criterion scale. Criteria now max out
+around 33–34, so that's rescaled to 7 — same roughly-20%-of-range trigger,
+just proportional to the smaller ranges.
+
+**Categories are back to a flat, named list — Division is gone.** Rather
+than "Historical" as one category with a Painters/Open/Junior division
+attached, the category list is now the 14 names you gave me directly:
+
+```
+Junior (under 18 years only)   Ordnance/Armor/Military Vehicles
+Historical Painters            Maritime/Ships
+Historical Open                Aircraft
+Fantasy/Science Fiction Painters   Civilian Vehicles
+Fantasy/Science Fiction Open   Gundam Painters
+Flats                          Gundam Open
+Wargame                        Diorama
+```
+
+Registration and every other screen lost the separate Division field —
+Painters/Open/Junior are baked into the category name itself now, so
+there's nothing left to ask for twice. I updated the 27 awards' eligibility
+filters to match these exact category names (Best Historical Painters now
+filters on the category literally named "Historical Painters," and so on).
+The four former Ordnance sub-classes each became a real category in their
+own right, which lines up one-to-one with the four awards that already
+existed for them — Best Ordnance now filters to
+"Ordnance/Armor/Military Vehicles" specifically, Best Maritime to
+"Maritime/Ships," and so on.
+
+One thing worth a decision from you: **there's no Bust category in this
+list**, but Best Bust was one of the 27 awards. I didn't delete the award —
+I moved it to the panel-discretion group (same as Best Napoleonic Figure
+or Blast from the Past), so the panel can still hand it to any entry, it
+just doesn't pre-filter to anything. If Bust should come back as its own
+category, or the award should go away entirely, say which and it's a
+one-line change either way.
+
+Also worth knowing: award names weren't part of this change, so "Best
+Fantasy & Sci-Fi Painters" is still the award's display name even though
+the category underneath it is spelled out as "Fantasy/Science Fiction
+Painters." They don't have to match — the filter does the work — but flag
+it if you'd rather the award name matched the category spelling exactly.
+
+**A real bug got caught and fixed along the way.** Testing the new
+category-name filters surfaced something that was silently broken since
+the original rewrite: award eligibility was checking a `categoryName`
+field that nothing ever actually set on an entry, so every category-
+specific award dropdown (Best Historical Painters, Best Diorama, all of
+them except Best Junior) has been showing zero eligible entries all along
+— unless "Show all entries" was ticked, which bypassed the bug by
+accident. Fixed in `src/awards.js` so eligibility now resolves the
+category name properly through the show's category list. Worth confirming
+on your next deploy that these dropdowns actually populate — that's a
+one-line check in the Step 5 checklist from `DEPLOY.md`.
+
 ## Judging
 
 Registration desk and Judging both still work the way they do now. What's
 new is inside Judging: a "Which judge are you?" picker (2 or 3 slots,
 whichever the show is set to), and each entry opens into a scoring panel —
-three criteria, Technical ability / Composition / Difficulty, marked 0–100.
+three criteria — Technical ability (0–33), Composition (0–33), Difficulty
+(0–34) — each capped at its own max and summed, not averaged.
 
 The maths: a judge's score is the average of their three marks. The panel
 score is the average of the judges' scores, rounded. That's the tier:
@@ -55,18 +129,6 @@ every entry if the panel wants to reach outside it. Capital Palette takes
 multiple recipients; the rest take one. Show Theme Award pulls its subtitle
 from the show theme text you set in Settings.
 
-## One real data-shape change: Category + Division
-
-The old category editor let you attach free-text "classes" to a category
-(the way Ordnance had Armor/Maritime/Aircraft/Civilian Vehicle stuffed
-inside it). That doesn't line up with awards like Best Maritime or Best
-Aircraft needing to query independently, so categories are back to a plain
-name list, and every entry now also picks a **Division** — Open, Painters,
-or Junior — the same one for every category. Existing entries load fine
-without it (they default to Open); you'll want to open Organizer → Entries
-once after deploying and set Division on anything registered before this
-went live.
-
 ## QR codes: no longer calls out to api.qrserver.com
 
 The QR on the confirmation screen and on every printed tag is now generated
@@ -83,7 +145,7 @@ Registrants get a "Print my tag" button on their confirmation screen. The
 desk gets a print icon on every row plus a bulk "select and print" bar.
 Organizer → Print adds print-all-tags, a results-and-awards sheet, and a
 rules sheet for handing to judges. Tags print two to a Letter sheet: QR,
-entry number, title, category, division, entrant, and a notes box roughly
+entry number, title, category, entrant, and a notes box roughly
 double a single line — big enough for what people actually write.
 
 ## Testing

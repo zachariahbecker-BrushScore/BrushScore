@@ -7,16 +7,26 @@
 // the count of numbers in the second average changes, so the tier bands
 // never move with panel size.
 
+// Each criterion carries its own share of the 100 points available, rather
+// than all three being marked 0-100 and averaged. A judge's mark for a
+// criterion cannot exceed that criterion's max, and a judge's score for an
+// entry is the SUM of their three marks — which lands between 0 and 100 by
+// construction, because the three max values below add up to exactly 100.
+// If you rebalance these, keep that invariant: the three .max values must
+// still sum to 100, or the tier bands (50/65/76/86) stop meaning what they say.
 export const CRITERIA = [
-  { key: 'technical', name: 'Technical ability',
+  { key: 'technical', name: 'Technical ability', max: 33,
     hint: 'Brushwork, blending, edge control, surface finish. Seams, mold lines and gaps. Quality of assembly and conversion work.' },
-  { key: 'composition', name: 'Composition',
+  { key: 'composition', name: 'Composition', max: 33,
     hint: "Colour, value and contrast. Pose, focal point and balance. Base, plinth and groundwork, and how the piece reads at arm's length." },
-  { key: 'difficulty', name: 'Difficulty',
+  { key: 'difficulty', name: 'Difficulty', max: 34,
     hint: 'Ambition of the subject. Scratch-building, sculpting and conversion. How much the piece asked of the modeller.' },
 ];
 
-export const PER_CRITERION_MAX = 100;
+// The sum of the three criteria maxes above — always 100 if the invariant
+// noted above holds. Computed rather than hard-coded so the rules text and
+// any future validation stay honest if the split above ever changes.
+export const CRITERIA_TOTAL = CRITERIA.reduce((sum, c) => sum + c.max, 0);
 
 // Mutable so a show's settings can move a band without a code change.
 export const TIERS = [
@@ -28,10 +38,13 @@ export const TIERS = [
 ];
 
 export const LIMITS = {
-  divergence: 14,   // points apart two judge scores may sit before reconciling
-  outlier: 20,      // points one judge score may sit from the average of the other two
-  boundary: 2,       // points below a tier line that trigger a head-judge look
-  criterionGap: 20, // per-criterion gap that gets re-marked during reconciliation
+  divergence: 14,  // points apart two judge scores (each already 0-100) may sit before reconciling
+  outlier: 20,     // points one judge score may sit from the average of the other two
+  boundary: 2,     // points below a tier line that trigger a head-judge look
+  // Per-criterion gap that gets re-marked during reconciliation. Criteria
+  // now max out around 33-34 rather than 100, so this is set to keep the
+  // same ~20% of range that 20-out-of-100 represented originally.
+  criterionGap: 7,
 };
 
 export function tierFor(score) {
@@ -43,11 +56,14 @@ function nextTierUp(tier) {
   return i > 0 ? TIERS[i - 1] : tier;
 }
 
-function judgeAverage(marks) {
+// A judge's score for an entry is the sum of their per-criterion marks
+// (each already capped at that criterion's own max) — not an average.
+// The three maxes already add up to 100, so the sum lands in 0-100 on its own.
+function judgeTotal(marks) {
   if (!marks) return null;
   const vals = CRITERIA.map((c) => marks[c.key]);
   if (vals.some((v) => v === null || v === undefined || v === '' || Number.isNaN(Number(v)))) return null;
-  return vals.reduce((a, b) => a + Number(b), 0) / CRITERIA.length;
+  return vals.reduce((a, b) => a + Number(b), 0);
 }
 
 export function fmt1(n) {
@@ -64,7 +80,7 @@ export function computeScore(scoresBySlot, expectedJudges, headConfirm) {
     .map(Number)
     .sort((a, b) => a - b);
   const judgeScores = slots
-    .map((slot) => ({ slot, score: judgeAverage(scoresBySlot[slot]) }))
+    .map((slot) => ({ slot, score: judgeTotal(scoresBySlot[slot]) }))
     .filter((j) => j.score !== null);
   const n = judgeScores.length;
 
