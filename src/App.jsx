@@ -46,9 +46,25 @@ function normalizeEntry(e) {
 }
 function normalizeConfig(c) {
   if (!c) return c;
+  const categories = c.categories && c.categories.length
+    ? c.categories
+    : DEFAULT_CATEGORIES.map((n) => ({ id: uid('cat'), name: n }));
+  // A show configured before the default category list changed keeps
+  // whatever it already had — DEFAULT_CATEGORIES only seeds a brand new
+  // show, it never rewrites one that already exists. So if the list has
+  // moved on since (the Ordnance subdivisions, say), an existing show
+  // won't pick that up on its own. Add whichever default names are
+  // missing here instead of requiring a manual Settings edit every time.
+  // Categories the organizer renamed, reordered, or added themselves are
+  // left exactly as they are — this only ever adds, never replaces.
+  const existingNames = new Set(categories.map((cat) => cat.name));
+  const missing = DEFAULT_CATEGORIES
+    .filter((n) => !existingNames.has(n))
+    .map((n) => ({ id: uid('cat'), name: n }));
   return {
     judgeCount: 3, headJudgeSlot: 1, showTheme: DEFAULT_SHOW_THEME, specialAwards: {},
     ...c,
+    categories: missing.length ? [...categories, ...missing] : categories,
   };
 }
 
@@ -1414,10 +1430,9 @@ function TagCard({ entry, config }) {
       <div className="tag-title">{entry.modelName}</div>
       <div className="tag-meta">
         <span>{categoryName(config, entry.categoryId)}</span>
-        <span>{entry.name}</span>
       </div>
       <div className="tag-notes">
-        <div className="lbl">Entrant notes</div>
+        <div className="lbl">Notes</div>
         <div className="body">{entry.notes}</div>
       </div>
     </div>
@@ -1576,9 +1591,20 @@ export default function App() {
   const refresh = useCallback(async () => {
     const cfgRaw = await safeGet('brushscore:config', true);
     const entRaw = await safeGet('brushscore:entries', true);
-    setConfig(normalizeConfig(cfgRaw ? JSON.parse(cfgRaw) : null));
+    const rawConfig = cfgRaw ? JSON.parse(cfgRaw) : null;
+    const normalized = normalizeConfig(rawConfig);
+    setConfig(normalized);
     setEntries((entRaw ? JSON.parse(entRaw) : []).map(normalizeEntry));
     setLoading(false);
+    // If the default category list picked up names the saved show doesn't
+    // have yet, normalizeConfig just added them with fresh ids. Persist
+    // that once, immediately — otherwise the next reload generates new
+    // random ids again, and any entry registered under the first set in
+    // the meantime would point at a category id that no longer exists.
+    if (rawConfig && normalized.categories.length !== (rawConfig.categories || []).length) {
+      try { await window.storage.set('brushscore:config', JSON.stringify(normalized), true); }
+      catch (e) { /* best effort — it simply re-merges next load if this fails */ }
+    }
   }, []);
 
   useEffect(() => { refresh(); }, [refresh]);

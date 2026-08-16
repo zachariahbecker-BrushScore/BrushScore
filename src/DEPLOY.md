@@ -114,7 +114,16 @@ Open `http://localhost:5173` and go through this in order:
    with no network request — open your browser's dev tools Network tab first if
    you want to see that nothing goes out to `api.qrserver.com` anymore.
    Click **Print my tag** and confirm a print preview opens with the QR,
-   title, category, and a notes box that's visibly bigger than before.
+   title, category, and a notes box that's visibly bigger than before —
+   and confirm your own name is *not* on it. Tags carry the model and
+   category only now, on purpose.
+2b. **Existing show, if you have one.** Refresh the app once and check
+    Organizer → Settings → category list (or just the Category dropdown
+    on the register form) for the four Ordnance subdivisions —
+    Ordnance/Armor/Military Vehicles, Maritime/Ships, Aircraft, Civilian
+    Vehicles. They should appear automatically on this first load without
+    you adding them by hand; if they don't, something's off and worth
+    reporting back rather than adding them manually as a workaround.
 3. **Registration Desk.** Confirm each row has a small print icon, and
    that you can select several entries and print them as a batch.
 4. **Judging.** Unlock with your staff PIN. Confirm a row of judge-slot

@@ -85,6 +85,37 @@ category name properly through the show's category list. Worth confirming
 on your next deploy that these dropdowns actually populate — that's a
 one-line check in the Step 5 checklist from `DEPLOY.md`.
 
+## Update — categories that don't show up on an already-configured show
+
+The Ordnance subdivisions (and any other name added to the default
+category list after a show was already set up) weren't appearing for a
+real reason: the default list only seeds a brand-new show. An existing
+show keeps whatever category list it already saved, and updating the
+source code doesn't reach back and rewrite that — same as changing a
+recipe doesn't change what's already in the oven.
+
+Fixed at load time rather than requiring a manual Settings visit: opening
+the app now checks the saved category list against the current defaults,
+and adds any default names that are missing — the four Ordnance
+subdivisions, for instance, if they weren't there before. Anything you
+renamed, reordered, or added yourself is left exactly as it is; this only
+ever adds names that are missing, never touches ones that already exist.
+The first time this runs it also saves the result back immediately, so
+the newly-added categories keep the same id on every later load rather
+than being regenerated — which matters, because entries already pointing
+at one of those categories would otherwise go stale on the next reload.
+
+Practically: deploy this update, open the app once, and the Ordnance
+categories (and anything else the default list has picked up since your
+show was configured) should just be there.
+
+## Update — printed tags no longer show the entrant's name
+
+Tags now carry only the model title, category, and notes — the entrant's
+name is gone from the printed tag entirely. Everywhere else it's
+unchanged: the desk, Organizer, and the results/awards sheet still show
+who registered what.
+
 ## Judging
 
 Registration desk and Judging both still work the way they do now. What's
@@ -145,8 +176,13 @@ Registrants get a "Print my tag" button on their confirmation screen. The
 desk gets a print icon on every row plus a bulk "select and print" bar.
 Organizer → Print adds print-all-tags, a results-and-awards sheet, and a
 rules sheet for handing to judges. Tags print two to a Letter sheet: QR,
-entry number, title, category, entrant, and a notes box roughly
-double a single line — big enough for what people actually write.
+entry number, model title, category, and a notes box roughly double a
+single line — big enough for what people actually write. **No entrant
+name on the tag** — deliberately, so it's the model that gets identified
+next to it, not who owns it. The entrant's name still lives in the data
+(desk and Organizer screens show it) and still appears on the results and
+awards sheet, since that one's naming a winner rather than sitting on a
+table.
 
 ## Testing
 
