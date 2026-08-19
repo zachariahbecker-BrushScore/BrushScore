@@ -197,6 +197,15 @@ function GlobalStyles() {
         .printdoc table { width: 100%; border-collapse: collapse; font-size: 9.5pt; margin-bottom: 4pt; }
         .printdoc th { text-align: left; border-bottom: 1pt solid #000; padding: 4pt 6pt; font-family: 'JetBrains Mono', monospace; font-size: 8pt; text-transform: uppercase; letter-spacing: .08em; }
         .printdoc td { padding: 4pt 6pt; border-bottom: 0.5pt solid #ccc; vertical-align: top; }
+        /* Keep a category's heading and its tier rows on one page where the
+           block will fit — a heading stranded at the foot of a page reads as
+           an empty category. Long categories still break normally. */
+        .printdoc .catblock { page-break-inside: avoid; break-inside: avoid; margin-bottom: 6pt; }
+        .printdoc td.tiername {
+          font-family: 'Oswald', sans-serif; font-size: 9.5pt; text-transform: uppercase;
+          letter-spacing: .08em; padding-top: 8pt; border-bottom: 0.75pt solid #000;
+        }
+        .printdoc .catcount { font-family: 'JetBrains Mono', monospace; font-size: 8pt; color: #444; }
 
         /* full-page table sign: legible from a few feet away, meant to
            stand alone on an easel or lie flat on the registration table.
@@ -1488,10 +1497,43 @@ function TagCard({ entry, config }) {
   );
 }
 
+/* Merit → Bronze → Silver → Gold: awards are read out ascending, so the
+   sheet is ordered the way it gets announced. Reverse this array to lead
+   each category with Gold instead. */
+const TIER_PRINT_ORDER = ['merit', 'bronze', 'silver', 'gold'];
+
 function ResultsSheet({ config, entries }) {
-  const rows = entries
-    .map((e) => ({ e, r: computeScore(e.scores, config.judgeCount, e.headConfirm) }))
-    .sort((a, b) => a.e.number - b.e.number);
+  const scored = entries.map((e) => ({ e, r: computeScore(e.scores, config.judgeCount, e.headConfirm) }));
+
+  const groupTiers = (inCat) =>
+    TIER_PRINT_ORDER
+      .map((key) => ({
+        t: TIERS.find((tt) => tt.key === key),
+        items: inCat.filter((x) => x.r.finalTier?.key === key).sort((a, b) => b.r.score - a.r.score),
+      }))
+      .filter((g) => g.t && g.items.length > 0);
+
+  // Categories drive the order, so the sheet matches the Settings list.
+  // An entry whose categoryId no longer resolves (its category was deleted
+  // after registration) would otherwise vanish from the printout entirely,
+  // so those are swept into a trailing Uncategorized block.
+  const known = new Set(config.categories.map((c) => c.id));
+  const buckets = config.categories.map((c) => ({
+    id: c.id,
+    name: c.name,
+    inCat: scored.filter((x) => x.e.categoryId === c.id),
+  }));
+  const orphans = scored.filter((x) => !known.has(x.e.categoryId));
+  if (orphans.length) buckets.push({ id: '__none', name: 'Uncategorized', inCat: orphans });
+
+  const sections = buckets
+    .filter((b) => b.inCat.length > 0)
+    .map((b) => ({
+      ...b,
+      tiers: groupTiers(b.inCat),
+      unplaced: b.inCat.filter((x) => !x.r.finalTier || x.r.finalTier.key === 'none'),
+    }));
+
   return (
     <div className="printdoc">
       <h1>{config.name}</h1>
@@ -1516,19 +1558,45 @@ function ResultsSheet({ config, entries }) {
           })}
         </tbody>
       </table>
-      <h2>Scores</h2>
-      <table>
-        <thead><tr><th>No.</th><th>Model</th><th>Entrant</th><th>Category</th><th>Score</th><th>Tier</th></tr></thead>
-        <tbody>
-          {rows.map(({ e, r }) => (
-            <tr key={e.id}>
-              <td>{e.number}</td><td>{e.modelName}</td><td>{e.name}</td>
-              <td>{categoryName(config, e.categoryId)}</td>
-              <td>{r.score ?? '—'}</td><td>{r.finalTier ? r.finalTier.name : '—'}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+      {sections.map((s) => (
+        <div className="catblock" key={s.id}>
+          <h2>{s.name} <span className="catcount">{s.inCat.length} {s.inCat.length === 1 ? 'entry' : 'entries'}</span></h2>
+          {s.tiers.length === 0 ? (
+            <p>No tier awards in this category.</p>
+          ) : (
+            <table>
+              <thead>
+                <tr>
+                  <th style={{ width: '10%' }}>No.</th>
+                  <th style={{ width: '40%' }}>Model</th>
+                  <th>Entrant</th>
+                  <th style={{ width: '12%' }}>Score</th>
+                </tr>
+              </thead>
+              <tbody>
+                {s.tiers.map(({ t, items }) => (
+                  <React.Fragment key={t.key}>
+                    <tr><td className="tiername" colSpan={4}>{t.name} · {items.length}</td></tr>
+                    {items.map(({ e, r }) => (
+                      <tr key={e.id}>
+                        <td>{pad(e.number)}</td>
+                        <td>{e.modelName}</td>
+                        <td>{e.name}</td>
+                        <td>{r.score}</td>
+                      </tr>
+                    ))}
+                  </React.Fragment>
+                ))}
+              </tbody>
+            </table>
+          )}
+          {s.unplaced.length > 0 && (
+            <p style={{ fontSize: '8.5pt', color: '#444' }}>
+              {s.unplaced.length} {s.unplaced.length === 1 ? 'entry' : 'entries'} with no award or not yet judged.
+            </p>
+          )}
+        </div>
+      ))}
     </div>
   );
 }
