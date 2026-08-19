@@ -419,6 +419,11 @@ const TIER_STYLE = {
 const TIER_BAR_COLOR = {
   gold: '#b45309', silver: '#64748b', bronze: '#9a3412', merit: '#475569', none: '#cbd5e1',
 };
+/* Merit → Bronze → Silver → Gold: awards are read out ascending, so both the
+   Organizer's tier summary and the printed results sheet list them in the
+   order they get announced. Reverse this array to lead with Gold instead —
+   it changes both places at once, which is the point of sharing it. */
+const TIER_PRINT_ORDER = ['merit', 'bronze', 'silver', 'gold'];
 
 function TierChip({ tier, size = 'md' }) {
   if (!tier) return <span className="text-xs text-slate-400">Unjudged</span>;
@@ -1169,39 +1174,76 @@ function EntriesTab({ config, entries, onUpdateEntry, onDeleteEntry }) {
   );
 }
 
+/* Shared by the Organizer's tier summary and the printed results sheet:
+   bucket entries by category in Settings order, then by tier within each.
+   An entry whose categoryId no longer resolves — its category was deleted
+   after the entry was registered — would otherwise drop out of both views
+   silently, so those are swept into a trailing Uncategorized bucket. */
+function groupByCategoryThenTier(config, entries) {
+  const scored = entries.map((e) => ({ e, r: computeScore(e.scores, config.judgeCount, e.headConfirm) }));
+  const known = new Set(config.categories.map((c) => c.id));
+  const buckets = config.categories.map((c) => ({ id: c.id, name: c.name, inCat: scored.filter((x) => x.e.categoryId === c.id) }));
+  const orphans = scored.filter((x) => !known.has(x.e.categoryId));
+  if (orphans.length) buckets.push({ id: '__none', name: 'Uncategorized', inCat: orphans });
+
+  return buckets
+    .filter((b) => b.inCat.length > 0)
+    .map((b) => ({
+      ...b,
+      tiers: TIER_PRINT_ORDER
+        .map((key) => ({
+          t: TIERS.find((tt) => tt.key === key),
+          items: b.inCat.filter((x) => x.r.finalTier?.key === key).sort((a, b2) => b2.r.score - a.r.score),
+        }))
+        .filter((g) => g.t && g.items.length > 0),
+      unplaced: b.inCat.filter((x) => !x.r.finalTier || x.r.finalTier.key === 'none'),
+    }));
+}
+
 function TierSummary({ config, entries }) {
-  const buckets = TIERS.map((t) => ({
-    t,
-    list: entries
-      .map((e) => ({ e, r: computeScore(e.scores, config.judgeCount, e.headConfirm) }))
-      .filter((x) => x.r.score !== null && x.r.finalTier.key === t.key)
-      .sort((a, b) => b.r.score - a.r.score),
-  }));
-  const unjudged = entries.filter((e) => computeScore(e.scores, config.judgeCount, e.headConfirm).score === null);
+  const sections = groupByCategoryThenTier(config, entries);
+
+  if (sections.length === 0) return <p className="text-xs text-slate-400 mb-6">No entries yet.</p>;
 
   return (
-    <div className="space-y-4 mb-6">
-      {buckets.filter((b) => b.t.key !== 'none').map((b) => (
-        <div key={b.t.key}>
-          <p className="text-xs font-semibold uppercase tracking-wide mb-1.5" style={{ color: TIER_BAR_COLOR[b.t.key] }}>
-            {b.t.name} · {b.list.length}
-          </p>
-          {b.list.length === 0 ? (
-            <p className="text-xs text-slate-400">—</p>
+    <div className="space-y-5 mb-6">
+      {sections.map((s) => (
+        <div key={s.id}>
+          <div className="flex items-baseline gap-2 border-b border-slate-200 pb-1 mb-2">
+            <h4 className="sb-display text-sm text-slate-900">{s.name}</h4>
+            <span className="sb-mono text-[10px] text-slate-400">
+              {s.inCat.length} {s.inCat.length === 1 ? 'entry' : 'entries'}
+            </span>
+          </div>
+          {s.tiers.length === 0 ? (
+            <p className="text-xs text-slate-400">No tier awards yet.</p>
           ) : (
-            <ul className="space-y-0.5">
-              {b.list.map(({ e, r }) => (
-                <li key={e.id} className="text-sm text-slate-700 flex items-center gap-2">
-                  <EntryBadgeInline number={e.number} />
-                  <span className="truncate">{e.modelName}</span>
-                  <span className="sb-mono text-xs text-slate-400 ml-auto">{r.score}</span>
-                </li>
+            <div className="space-y-2.5">
+              {s.tiers.map(({ t, items }) => (
+                <div key={t.key}>
+                  <p className="text-xs font-semibold uppercase tracking-wide mb-1" style={{ color: TIER_BAR_COLOR[t.key] }}>
+                    {t.name} · {items.length}
+                  </p>
+                  <ul className="space-y-0.5">
+                    {items.map(({ e, r }) => (
+                      <li key={e.id} className="text-sm text-slate-700 flex items-center gap-2">
+                        <EntryBadgeInline number={e.number} />
+                        <span className="truncate">{e.modelName}</span>
+                        <span className="sb-mono text-xs text-slate-400 ml-auto">{r.score}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
               ))}
-            </ul>
+            </div>
+          )}
+          {s.unplaced.length > 0 && (
+            <p className="text-xs text-slate-400 mt-1.5">
+              {s.unplaced.length} {s.unplaced.length === 1 ? 'entry' : 'entries'} with no award or not yet judged.
+            </p>
           )}
         </div>
       ))}
-      {unjudged.length > 0 && <p className="text-xs text-slate-400">{unjudged.length} entries still unjudged.</p>}
     </div>
   );
 }
@@ -1497,42 +1539,8 @@ function TagCard({ entry, config }) {
   );
 }
 
-/* Merit → Bronze → Silver → Gold: awards are read out ascending, so the
-   sheet is ordered the way it gets announced. Reverse this array to lead
-   each category with Gold instead. */
-const TIER_PRINT_ORDER = ['merit', 'bronze', 'silver', 'gold'];
-
 function ResultsSheet({ config, entries }) {
-  const scored = entries.map((e) => ({ e, r: computeScore(e.scores, config.judgeCount, e.headConfirm) }));
-
-  const groupTiers = (inCat) =>
-    TIER_PRINT_ORDER
-      .map((key) => ({
-        t: TIERS.find((tt) => tt.key === key),
-        items: inCat.filter((x) => x.r.finalTier?.key === key).sort((a, b) => b.r.score - a.r.score),
-      }))
-      .filter((g) => g.t && g.items.length > 0);
-
-  // Categories drive the order, so the sheet matches the Settings list.
-  // An entry whose categoryId no longer resolves (its category was deleted
-  // after registration) would otherwise vanish from the printout entirely,
-  // so those are swept into a trailing Uncategorized block.
-  const known = new Set(config.categories.map((c) => c.id));
-  const buckets = config.categories.map((c) => ({
-    id: c.id,
-    name: c.name,
-    inCat: scored.filter((x) => x.e.categoryId === c.id),
-  }));
-  const orphans = scored.filter((x) => !known.has(x.e.categoryId));
-  if (orphans.length) buckets.push({ id: '__none', name: 'Uncategorized', inCat: orphans });
-
-  const sections = buckets
-    .filter((b) => b.inCat.length > 0)
-    .map((b) => ({
-      ...b,
-      tiers: groupTiers(b.inCat),
-      unplaced: b.inCat.filter((x) => !x.r.finalTier || x.r.finalTier.key === 'none'),
-    }));
+  const sections = groupByCategoryThenTier(config, entries);
 
   return (
     <div className="printdoc">
