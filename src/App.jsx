@@ -79,12 +79,24 @@ async function safeGet(key, shared) {
    live in their own store. Per-entry `scores` and `headConfirm` written by
    the old rubric build are left on the record but never read; they carry no
    meaning under this system and nothing recomputes from them. */
+/* Registration used to collect one free-text "email or phone" box. Entries
+   saved under that build are split here: an @ means it was an email, and
+   anything else is treated as a phone number. The original string is kept in
+   `contact` untouched, so nothing is lost if a guess goes the wrong way. */
+function splitLegacyContact(e) {
+  if (e.email !== undefined || e.phone !== undefined) return {};
+  const legacy = (e.contact || '').trim();
+  if (!legacy) return {};
+  return legacy.includes('@') ? { email: legacy } : { phone: legacy };
+}
+
 function normalizeEntry(e) {
   return {
-    contact: '', notes: '',
+    contact: '', email: '', phone: '', notes: '',
     checkedIn: false, checkedInAt: null,
     registeredAt: null,
     ...e,
+    ...splitLegacyContact(e),
   };
 }
 
@@ -125,6 +137,17 @@ function teamForCategory(config, categoryId) {
 function judgeCountForGroup(config, categoryId) {
   const t = teamForCategory(config, categoryId);
   return Number(t?.judgeCount) || Number(config.teams?.[0]?.judgeCount) || 3;
+}
+
+/* Free-text search used by both the Registration Desk and the Organizer's
+   entries list. Email and phone are included so desk staff can find someone
+   who only remembers the address they signed up with. */
+function entryMatches(e, query) {
+  const s = (query || '').trim().toLowerCase();
+  if (!s) return true;
+  return [e.name, e.modelName, e.email, e.phone, String(e.number)]
+    .filter(Boolean)
+    .some((field) => String(field).toLowerCase().includes(s));
 }
 
 /* Which entries actually hold a medal, and how they came by it. The two
@@ -920,7 +943,7 @@ function SetupWizard({ initial, onSave, onCancel, isEdit }) {
 function RegisterView({ config, onSubmit, onPrintTag, remember = true }) {
   const firstCat = config.categories[0];
   const [form, setForm] = useState({
-    name: '', contact: '', modelName: '',
+    name: '', email: '', phone: '', modelName: '',
     categoryId: firstCat?.id || '', notes: '',
   });
   const [confirmed, setConfirmed] = useState(null);
@@ -982,9 +1005,32 @@ function RegisterView({ config, onSubmit, onPrintTag, remember = true }) {
       <Field label="Your name">
         <input className="sb-input" value={form.name} onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))} required />
       </Field>
-      <Field label="Email or phone">
-        <input className="sb-input" value={form.contact} onChange={(e) => setForm((f) => ({ ...f, contact: e.target.value }))} placeholder="For award notifications (optional)" />
-      </Field>
+      <div className="grid sm:grid-cols-2 gap-4">
+        <Field label="Email">
+          <input
+            className="sb-input"
+            type="email"
+            autoComplete="email"
+            value={form.email}
+            onChange={(e) => setForm((f) => ({ ...f, email: e.target.value }))}
+            placeholder="you@example.com"
+          />
+        </Field>
+        <Field label="Phone">
+          <input
+            className="sb-input"
+            type="tel"
+            inputMode="tel"
+            autoComplete="tel"
+            value={form.phone}
+            onChange={(e) => setForm((f) => ({ ...f, phone: e.target.value }))}
+            placeholder="(555) 555-5555"
+          />
+        </Field>
+      </div>
+      <p className="text-xs text-slate-400 -mt-2">
+        Both optional — used only if the show needs to reach you about an award.
+      </p>
       <Field label="Model / subject name">
         <input className="sb-input" value={form.modelName} onChange={(e) => setForm((f) => ({ ...f, modelName: e.target.value }))} placeholder="e.g. Sherman M4A3" required />
       </Field>
@@ -1012,8 +1058,7 @@ function DeskView({ config, entries, onCheckIn, onWalkIn, onPrintTags, notify })
 
   const filtered = entries
     .filter((e) => {
-      const s = q.toLowerCase();
-      return !s || e.name.toLowerCase().includes(s) || String(e.number).includes(s) || e.modelName.toLowerCase().includes(s);
+      return entryMatches(e, q);
     })
     .sort((a, b) => a.number - b.number);
 
@@ -1585,8 +1630,7 @@ function EntriesTab({ config, entries, groupRecords, onUpdateEntry, onDeleteEntr
   const { byEntry } = buildAwards(entries, groupRecords, config);
   const filtered = entries
     .filter((e) => {
-      const s = q.toLowerCase();
-      return !s || e.name.toLowerCase().includes(s) || e.modelName.toLowerCase().includes(s) || String(e.number).includes(s);
+      return entryMatches(e, q);
     })
     .sort((a, b) => a.number - b.number);
 
@@ -1606,7 +1650,7 @@ function EntriesTab({ config, entries, groupRecords, onUpdateEntry, onDeleteEntr
               <div className="flex-1 min-w-0">
                 <p className="font-medium text-slate-900 truncate">{e.modelName}</p>
                 <p className="text-xs text-slate-500 truncate">
-                  {e.name}{e.contact ? ` · ${e.contact}` : ''}{note ? ` · ${note}` : ''}
+                  {[e.name, e.email, e.phone, note].filter(Boolean).join(' · ')}
                 </p>
               </div>
               <MedalChip medal={row ? row.result.finalMedal : null} size="sm" />
@@ -2483,7 +2527,9 @@ export default function App() {
     const number = latestConfig.nextEntryNumber || latestEntries.length + 1;
     const entry = normalizeEntry({
       id: uid('entry'), number,
-      name: form.name.trim(), contact: (form.contact || '').trim(),
+      name: form.name.trim(),
+      email: (form.email || '').trim(),
+      phone: (form.phone || '').trim(),
       modelName: form.modelName.trim(), categoryId: form.categoryId,
       notes: (form.notes || '').trim(),
       checkedIn: isWalkIn, checkedInAt: isWalkIn ? new Date().toISOString() : null,
