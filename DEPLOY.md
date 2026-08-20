@@ -1,15 +1,29 @@
-# Deploying the judging update
+# Deploying the Open judging system
 
-This updates the app that's actually live on your domain — the
-React + Vite + Supabase build, not the standalone HTML version from
-earlier in this project. Four files change. Nothing else does: same
-`package.json`, same Supabase table, no new environment variables, no
-schema migration. That's what makes this a much shorter deploy than the
-relational-database version would have been.
+This updates the app running on your domain — the React + Vite + Supabase
+build. Two source files change, plus three documents. Nothing else does: same
+`package.json`, same Supabase table, no new environment variables, no schema
+migration.
 
-Budget 30–45 minutes if this is a fresh show with no entries yet, or about
-an hour if you need to migrate existing registrations (Step 6 covers that
-— skip it if there's nothing registered yet).
+Budget 30–45 minutes for a fresh show. Read **Step 0** first — if you have a
+show that's already been judged, that changes your plan.
+
+---
+
+## Step 0 — Before anything: is a show already judged?
+
+Scores from the previous rubric build **do not convert**. A judge score out of
+100 has no honest translation into a 0–4 mark, so the app ignores old scores
+rather than guessing. Any show already judged will show as unjudged after this
+deploy.
+
+- **Nothing judged yet** → carry on, no issue.
+- **Judging in progress** → finish that show on the current build, then deploy.
+- **Judged and finished, want the record kept** → print the results sheet from
+  the current build *before* deploying, and keep the CSV from Step 2.
+
+Registrations, check-ins, categories, and special awards are all unaffected.
+This is only about scores.
 
 ---
 
@@ -18,177 +32,194 @@ an hour if you need to migrate existing registrations (Step 6 covers that
 ```bash
 git clone https://github.com/<you>/brushscore.git
 cd brushscore
-git checkout -b judging-update
+git checkout -b open-judging
 ```
 
-Already have it cloned? Just make sure it's current and start a branch
-there instead:
+Already cloned? Update and branch there instead:
 
 ```bash
 cd brushscore
 git pull
-git checkout -b judging-update
+git checkout -b open-judging
 ```
 
-Working on a branch means production keeps running on the old code until
-you're ready to merge — nothing changes for anyone using the live link
-until Step 9.
+Working on a branch means production keeps running on the old code until you
+merge at Step 9.
 
 ---
 
 ## Step 2 — Back up your data
 
-Before touching anything, export what's in Supabase now. **Table Editor →
-`brushscore_kv` → Export → CSV**, or from SQL Editor:
+**Table Editor → `brushscore_kv` → Export → CSV**, or from SQL Editor:
 
 ```sql
 copy (select * from brushscore_kv) to stdout with csv header;
 ```
 
-Takes ten seconds and means a bad deploy costs you a rollback, not your
-show's registrations.
+Ten seconds, and it means a bad deploy costs a rollback rather than your show's
+registrations.
 
 ---
 
-## Step 3 — Drop in the four files
-
-Copy these into `src/`, overwriting `App.jsx`:
+## Step 3 — Drop in the files
 
 ```
-src/App.jsx      (replace)
-src/scoring.js   (new)
-src/awards.js    (new)
-src/qrcode.js    (new)
+src/App.jsx                  (replace)
+src/scoring.js               (replace)
+BrushScore-User-Manual.docx  (replace)
+CHANGES.md                   (replace)
+DEPLOY.md                    (replace — this file)
 ```
 
-Nothing else in the project changes. Specifically — do **not** touch:
-`package.json`, `vite.config.js`, `tailwind.config.js`,
-`postcss.config.js`, `main.jsx`, `index.html`, `index.css`,
-`storageShim.js`, `supabaseClient.js`, `supabase-setup.sql`, `.env`. If
-your diff touches any of those, something copied wrong — check before
-continuing.
+`src/awards.js` and `src/qrcode.js` are **unchanged**. Do not replace them.
+
+Do **not** touch: `package.json`, `vite.config.js`, `tailwind.config.js`,
+`postcss.config.js`, `main.jsx`, `index.html`, `index.css`, `storageShim.js`,
+`supabaseClient.js`, `supabase-setup.sql`, `.env`, or anything in
+`src/assets/`. If your diff touches any of those, something copied wrong.
 
 ```bash
-git add src/App.jsx src/scoring.js src/awards.js src/qrcode.js
 git status
 ```
 
-Confirm the status shows exactly one modified file and three new ones.
+Confirm exactly five modified files and nothing else.
 
 ---
 
 ## Step 4 — Install and build locally
-
-No new dependencies were added, but running install confirms your
-lockfile is happy:
 
 ```bash
 npm install
 npm run build
 ```
 
-The build should complete clean — this is the same command Vercel or
-Netlify will run, so a failure here is a failure there. If it fails, stop
-and paste the error rather than pushing.
+No new dependencies were added; the install just confirms your lockfile is
+happy. The build must complete clean — it's the same command your host runs, so
+a failure here is a failure there. If it fails, stop and report the error
+rather than pushing.
 
 ---
 
-## Step 5 — Run it and walk through the checklist
+## Step 5 — Run it and walk the checklist
 
 ```bash
 npm run dev
 ```
 
-Open `http://localhost:5173` and go through this in order:
+Open `http://localhost:5173` and go in order.
 
-1. **Setup or Settings.** If this is a fresh install you'll land on the
-   setup wizard. If you already have a show configured, go to
-   Organizer → Settings → Edit show settings. Either way, confirm the new
-   **Judging panel** section is there — Judges per entry (2 or 3) and
-   Head judge — and a **Show theme** field. Set them for your show.
-2. **Register a test entry.** Confirm the Category dropdown lists the
-   full 14-name set — Junior, Historical Painters, Historical Open, and
-   so on — with no separate Division field alongside it (Painters, Open
-   and Junior are baked into the category names themselves now). Submit
-   it, and on the confirmation screen confirm the QR renders instantly
-   with no network request — open your browser's dev tools Network tab first if
-   you want to see that nothing goes out to `api.qrserver.com` anymore.
-   Click **Print my tag** and confirm a print preview opens with the QR,
-   title, category, and a notes box that's visibly bigger than before.
-3. **Registration Desk.** Confirm each row has a small print icon, and
-   that you can select several entries and print them as a batch.
-4. **Judging.** Unlock with your staff PIN. Confirm a row of judge-slot
-   buttons appears at the top ("I am — Judge 1 · Head, Judge 2, Judge 3").
-   Open your test entry, and as Judge 1 enter three marks — Technical
-   ability (0–33), Composition (0–33), Difficulty (0–34), each field
-   capped at its own max, with the range printed right next to the
-   label. Confirm a score meter and a tier chip appear. Switch to
-   Judge 2, enter marks, then Judge 3 if your panel is set to 3 —
-   confirm the panel score is the average of the three judges' totals,
-   rounded.
-   Test the two-judge path too: in Settings, switch Judges per entry to
-   2, come back, and score an entry with a wide split — something like
-   29/30/31 for one judge (a 90) and 23/23/24 for the other (a 70) —
-   confirm a **Reconcile** notice appears. Then try two scores landing
-   within 2 points of a tier line — 27/28/29 both judges (an 84, just
-   under Gold's 86) — confirm a **Head judge** notice appears, and that
-   only the slot marked head in Settings can click "Move up a tier."
-5. **Organizer → Awards.** Confirm all 27 named awards are listed, that
-   Best Junior's dropdown only offers entries registered under the
-   Junior category, that Best Historical Painters only offers Historical
-   Painters entries (not Historical Open), and that the Capital Palette
-   award lets you add more than one recipient. If any category-specific
-   dropdown comes up empty when it shouldn't, that's the eligibility bug
-   this update fixed — see CHANGES.md — so it's worth this specific check.
-6. **Organizer → Print.** Try each of the three buttons — all tags,
-   results & awards sheet, judging rules — and confirm each opens a print
-   preview without error.
-7. **Results.** With something published, confirm the tier groupings and
-   the special-awards list render.
+### 5.1 Settings — teams and Chairman
 
-Delete the test entry when you're done (Organizer → Entries → trash
-icon) so it doesn't show up in your real show.
+Organizer → Settings → Edit show settings. Confirm:
+
+- An **Awards Committee Chairman** field.
+- A **Judging teams** section, with at least one team. Each team has a name, a
+  size (3 or 2), a name box per judge seat, and a row of category buttons.
+- The old "Judges per entry / Head judge" panel is **gone**. If it's still
+  there, the file didn't copy.
+
+Set up your real teams. Assign each its categories; anything you leave
+unassigned is visible to all teams. Fill in judge names — that's what enables
+the own-work check.
+
+### 5.2 Register a test entry
+
+Confirm the form has **separate Email and Phone boxes** (not one combined
+field). Submit, and confirm:
+
+- The QR renders instantly with no network request.
+- **Print my tag** opens a preview with QR, title, category, notes box — and
+  **no entrant name** on the tag.
+- Back on the home page, a **Your entries** panel lists what you just
+  registered, with a print button.
+
+Register **three more entries under the same name in the same category** —
+you'll need them for 5.4.
+
+### 5.3 Registration Desk
+
+Unlock with the staff PIN. Confirm the per-row print icon and batch select-and-
+print still work. Search for your test entrant by the **email address** you
+registered them with — it should match.
+
+### 5.4 Judging — the important one
+
+Unlock with the staff PIN.
+
+1. Confirm a **team picker** (if you have more than one team) and a row of
+   **Judge 1 / 2 / 3** seat buttons showing judge names.
+2. Open a single-piece entry. Confirm **one row of 0–4 buttons**, not three
+   numeric criterion fields. Confirm a "Judging criteria" expander listing the
+   six criteria.
+3. Open the four-piece group from 5.2. Confirm a **"Team decision needed"**
+   notice and that the 0–4 buttons are **disabled**. Choose *Pick one as
+   representative*, select a piece, and confirm the buttons enable.
+4. Mark it 4 as Judge 1. Switch to Judge 2 — confirm you could not see Judge
+   1's mark before entering your own. Mark 4, then 4 as Judge 3. Confirm
+   **12/12 and a Gold Medal**.
+5. Switch that group to **Award the whole collection** and confirm the marks
+   **clear** — that's intended, not a bug.
+6. Score another group 4 / 2 / 4 and confirm a **Judges disagree** flag.
+7. If a judge's name in Settings matches the test entrant's name exactly,
+   confirm that group locks for that seat with an **Own work** notice.
+
+### 5.5 Organizer → Judging
+
+Confirm the tab exists and lists your groups with marks and totals. Tick **Only
+groups needing review** and confirm the flagged one appears. Open it, set a
+Chairman ruling with a reason, and confirm the medal changes and is marked as a
+ruling. Clear it again.
+
+### 5.6 Organizer → Awards
+
+Confirm the **Medal results** summary shows your groups, with collection awards
+naming the exhibitor and listing pieces underneath, and representative awards
+noting what they stood for.
+
+Confirm all 27 special awards list, that Best Junior only offers Junior
+entries, Best Historical Painters only Historical Painters, and that Capital
+Palette accepts more than one recipient.
+
+### 5.7 Organizer → Print
+
+**Four** buttons now: registration sign, all tags, results & awards sheet,
+judging rules. Open each.
+
+On the **results & awards sheet**, confirm it's grouped by category, that
+medals within a category run **Bronze → Silver → Gold**, and that your
+collection award lists its pieces.
+
+On the **judging rules sheet**, confirm it describes the 0–4 mark and the
+correct band table, and says nothing about tiers, Merit, or a head judge.
+
+### 5.8 Results
+
+Publish and confirm medals render with the collection/representative
+distinction intact.
+
+Delete your test entries when done (Organizer → Entries → trash icon).
 
 ---
 
-## Step 6 — Migrate existing entries (skip if nothing's registered yet)
+## Step 6 — Existing shows
 
-One field doesn't carry over as cleanly as everything else, so if you
-already have real registrations, do this before you announce the update.
+**Categories.** Unchanged by this update. If your Ordnance subdivisions are
+already present, nothing to do. If not, Organizer → Settings → **Restore any
+missing default categories**.
 
-**Categories.** The category list is now this exact 14-name set — Division
-is gone, so Painters/Open/Junior live in the category name itself:
+**Teams.** A show configured before this update is migrated automatically to a
+single team named "Team A", sized from your old `judgeCount`, covering every
+category. If you want more than one team, or want judge names for the own-work
+check, set that up in Settings — it isn't done for you.
 
-```
-Junior (under 18 years only)      Ordnance/Armor/Military Vehicles
-Historical Painters               Maritime/Ships
-Historical Open                   Aircraft
-Fantasy/Science Fiction Painters  Civilian Vehicles
-Fantasy/Science Fiction Open      Gundam Painters
-Flats                             Gundam Open
-Wargame                           Diorama
-```
+**Head judge.** Whatever slot was marked head is simply dropped. There's nothing
+to migrate; the Chairman replaces the role.
 
-In Organizer → Settings, rename your existing categories to match these —
-you don't strictly have to use these exact names, but the 27 awards'
-eligibility filters in `src/awards.js` are written against this exact set,
-so a category that doesn't match one of these strings won't feed any
-award's dropdown. If you rename a category that already has entries, go to
-Organizer → Entries afterward and reassign those entries to the new name —
-renaming the category in Settings doesn't retroactively touch entries
-already filed under the old name.
-
-If your existing categories used a Division field (Open/Painters/Junior)
-alongside a plain category name, that field is gone from the entry form
-now — there's nothing to migrate for it specifically, since the category
-rename above is what replaces it. An entry that was "Historical" +
-division "Painters" just needs its category changed to "Historical
-Painters" directly.
-
-This doesn't need to happen before you deploy — the app runs fine with
-whatever category names are already there. It just means the category-
-specific awards won't have the right candidates in their dropdowns until
-you do this pass.
+**Contact details.** Existing entries split automatically: a saved contact
+containing `@` becomes the email, anything else the phone. Spot-check a few in
+Organizer → Entries. Anything that lands in the wrong box can be fixed by
+re-registering that entrant, and the original string is preserved in the data
+either way.
 
 ---
 
@@ -196,22 +227,20 @@ you do this pass.
 
 ```bash
 git add -A
-git commit -m "Judging: multi-judge scoring, 27 awards, offline QR, tag printing"
-git push -u origin judging-update
+git commit -m "Judging: Open system — teams, 0-4 marks, group awards, Chairman rulings"
+git push -u origin open-judging
 ```
 
 ---
 
 ## Step 8 — Open a PR and check the preview
 
-If your repo is connected to Vercel or Netlify, pushing the branch
-triggers a preview deployment automatically — check your host's dashboard
-for a preview URL, or look for a bot comment on the PR with the link.
+If your repo is connected to Vercel or Netlify, pushing triggers a preview
+deployment — check the dashboard or the PR bot comment for the URL.
 
-Run through the Step 5 checklist again on the preview URL specifically.
-It's talking to the same Supabase project as production, so use another
-throwaway test entry and delete it after — don't test against anything
-that matters on the branch preview.
+Run the Step 5 checklist again on the preview. It talks to the **same Supabase
+project as production**, so use throwaway entries and delete them after. Don't
+test against anything that matters.
 
 ---
 
@@ -219,37 +248,65 @@ that matters on the branch preview.
 
 ```bash
 git checkout main
-git merge judging-update
+git merge open-judging
 git push
 ```
 
-This triggers your production deploy the same way any other push does —
-no new environment variables, no dashboard changes, nothing else to flip.
-Watch your host's dashboard for the build to go green.
+No new environment variables, no dashboard changes. Watch the build go green.
 
 ---
 
 ## Step 10 — Final check on the real domain
 
-Once production is live, do one more pass on your actual URL: register a
-test entry, print its tag, score it as two different judges, confirm the
-tier and a special-award assignment show up on Results, then delete the
-test entry. This is the same list as Step 5 — the point is running it
-against the real domain and real DNS, not localhost, since that's what
-catches anything environment-specific.
+One more pass on your actual URL: register a test entry, print its tag, score
+it as a full team, set and clear a Chairman ruling, print the awards sheet,
+then delete the entry. Same list as Step 5 — the point is running it against
+real DNS and the real domain, which is what catches anything
+environment-specific.
+
+**Also do these two on real hardware**, because they can't be checked any other
+way:
+
+- **Scan a printed tag with the actual desk device.** Camera QR scanning needs
+  https and camera permission, and it downloads its decoding library from a CDN
+  at the moment you tap Scan — so it needs working internet, not just a working
+  camera. If venue wifi is unreliable, know that check-in by name search still
+  works fine.
+- **Print one tag sheet and one awards sheet on the actual printer.** The
+  layouts use fixed-inch print CSS; a preview is not proof.
 
 ---
 
 ## What to tell your judges and desk staff
 
-Nothing about their PIN or their link changes. What's new for judges: they
-now pick which judge they are before scoring, and they score three
-numbers instead of picking one award from a list. Print the judging rules
-sheet (Organizer → Print) and hand it out before the next show — it has
-the rubric and both the two-judge and three-judge protocols spelled out.
+PINs and links are unchanged.
+
+**Judges** have the biggest change and should be briefed before show day:
+
+- Pick your **team and seat** once at the start.
+- You give **one number from 0 to 4** per piece or group — not three criterion
+  scores. The six criteria inform that one number.
+- Where an exhibitor has several pieces in a category, **the team decides
+  together** whether to judge the best one as representative or award the whole
+  collection.
+- You do not judge your own work.
+- Disagreements and ties go to the **Awards Committee Chairman**, whose
+  decision is final. There is no head judge.
+
+Print the judging rules sheet (Organizer → Print) and hand it out. Appendix C
+of the user manual is the same content.
+
+**Desk staff:** registration now asks for email and phone separately, and the
+search box matches both.
+
+---
 
 ## If a judge doesn't show up on show day
 
-Organizer → Settings → Judges per entry → 2. Save. No redeploy, no code
-change — the two-judge reconciliation and boundary rules take over
-immediately for every entry from that point on.
+Organizer → Settings → that team → Judges → 2. Save. The two-judge bands take
+over immediately for that team's groups. No redeploy.
+
+Note it changes the maximum from 12 to 8, so don't switch a team mid-category
+if you can avoid it — groups already scored by three judges keep their
+three-judge totals, and you'd be comparing across two different scales within
+one category.
