@@ -6,8 +6,8 @@ import {
 } from 'lucide-react';
 import { encodeQR } from './qrcode';
 import {
-  CRITERIA, TIERS, LIMITS,
-  computeScore, fmt1, flagLabel, reconciliationText,
+  CRITERIA, MEDALS, MARK_GUIDE, MAX_PER_JUDGE, MEDAL_BANDS, medalByKey,
+  computeGroup, makeGroupKey, emptyGroup, isOwnWork, flagLabel, fmtPoints,
 } from './scoring';
 import {
   DEFAULT_CATEGORIES, DEFAULT_SHOW_THEME,
@@ -24,6 +24,42 @@ function uid(prefix = 'id') {
 function pad(n) { return String(n).padStart(3, '0'); }
 function categoryName(config, id) { return config.categories.find((c) => c.id === id)?.name || '—'; }
 
+/* ------------------------- remembered entries (device) -------------------------
+
+   Registration takes no account and no password, so there is nothing to log
+   back in to. Instead the device that submitted an entry remembers it, and
+   the home page offers those entries back — enough to recover a lost tag on
+   your own phone without putting entrant names behind a public search box
+   that anyone could browse. Anyone on a different device asks the desk,
+   which can already search by name, number, or model and reprint.
+
+   Walk-ins are deliberately not remembered: they are submitted on the desk's
+   device, not the registrant's, and the tag is printed on the spot. */
+const MY_ENTRIES_KEY = 'brushscore:myEntries';
+
+function readMyEntries() {
+  try {
+    const raw = localStorage.getItem(MY_ENTRIES_KEY);
+    const list = raw ? JSON.parse(raw) : [];
+    return Array.isArray(list) ? list : [];
+  } catch (e) {
+    return [];
+  }
+}
+function rememberMyEntry(entry) {
+  try {
+    const list = readMyEntries().filter((x) => x.id !== entry.id);
+    list.push({ id: entry.id, number: entry.number });
+    localStorage.setItem(MY_ENTRIES_KEY, JSON.stringify(list));
+  } catch (e) {
+    // Storage can be unavailable (private browsing, storage full). Losing the
+    // reminder is not worth failing a registration over.
+  }
+}
+function forgetMyEntries() {
+  try { localStorage.removeItem(MY_ENTRIES_KEY); } catch (e) { /* nothing to do */ }
+}
+
 async function safeGet(key, shared) {
   try {
     const res = await window.storage.get(key, shared);
@@ -36,15 +72,88 @@ async function safeGet(key, shared) {
 /* One-time normalization so entries and config saved by an earlier version
    of the app (single-award dropdown, category classes, no judgeCount) load
    without crashing. New fields fill in with sensible defaults; old fields
-   that are no longer used are simply ignored from here on. */
+   that are no longer used are simply ignored from here on.
+
+   Under the Open system a piece is no longer scored on its own — the unit of
+   judging is the group (one exhibitor's entries in one category), and marks
+   live in their own store. Per-entry `scores` and `headConfirm` written by
+   the old rubric build are left on the record but never read; they carry no
+   meaning under this system and nothing recomputes from them. */
 function normalizeEntry(e) {
   return {
     contact: '', notes: '',
     checkedIn: false, checkedInAt: null,
-    scores: {}, headConfirm: null,
     registeredAt: null,
     ...e,
   };
+}
+
+/* --------------------------------- groups ---------------------------------
+
+   Groups are derived from the entry list, never stored as records of their
+   own: one group per exhibitor per category, keyed by normalized name +
+   category id. An exhibitor with pieces in three categories therefore has
+   three groups, each judged separately; an exhibitor cannot have two
+   separate groups inside one category. Move an entry to another category in
+   the Organizer Console and it simply joins that category's group.
+
+   Only the team's decisions about a group — the scope, the representative
+   piece, the marks, any Chairman ruling — are persisted, under the group
+   key, in `brushscore:groups`.
+--------------------------------------------------------------------------- */
+function buildGroups(entries) {
+  const map = new Map();
+  entries.forEach((e) => {
+    const key = makeGroupKey(e.name, e.categoryId);
+    if (!map.has(key)) {
+      map.set(key, { key, name: e.name, categoryId: e.categoryId, entries: [] });
+    }
+    map.get(key).entries.push(e);
+  });
+  return Array.from(map.values()).map((g) => ({
+    ...g,
+    entries: g.entries.sort((a, b) => a.number - b.number),
+  })).sort((a, b) => a.entries[0].number - b.entries[0].number);
+}
+
+/* Which team judges a given category. Categories left unassigned are open to
+   every team so nothing silently goes unjudged. */
+function teamForCategory(config, categoryId) {
+  const teams = config.teams || [];
+  return teams.find((t) => (t.categoryIds || []).includes(categoryId)) || null;
+}
+function judgeCountForGroup(config, categoryId) {
+  const t = teamForCategory(config, categoryId);
+  return Number(t?.judgeCount) || Number(config.teams?.[0]?.judgeCount) || 3;
+}
+
+/* Which entries actually hold a medal, and how they came by it. The two
+   selection decisions differ exactly here: under `representative` only the
+   selected piece is medalled and the rest of the group stays unmedalled;
+   under `collection` every piece in the group takes the same medal. A group
+   of one behaves like a representative decision with the choice made for it. */
+function buildAwards(entries, groupRecords, config) {
+  const rows = buildGroups(entries).map((g) => {
+    const result = computeGroup(groupRecords[g.key], judgeCountForGroup(config, g.categoryId), g.entries.map((e) => e.id));
+    const rep = result.scope === 'representative'
+      ? g.entries.find((e) => e.id === result.repEntryId) || null
+      : null;
+    const won = result.finalMedal && result.finalMedal.key !== 'none';
+    const medalled = !won ? [] : result.scope === 'representative' ? (rep ? [rep] : []) : g.entries;
+    return { group: g, result, rep, medalled };
+  });
+  const byEntry = new Map();
+  rows.forEach((row) => row.medalled.forEach((e) => byEntry.set(e.id, row)));
+  return { rows, byEntry };
+}
+
+/* How a group's award should be described wherever it is announced or
+   printed — the distinction the awards list has to carry. */
+function awardScopeNote(row) {
+  const n = row.group.entries.length;
+  if (n === 1) return '';
+  if (row.result.scope === 'collection') return `Collection award — all ${n} pieces`;
+  return `Representative of ${n} pieces`;
 }
 // Adds any DEFAULT_CATEGORIES name missing from an existing list. Pure and
 // additive only — never renames, reorders, or removes anything already
@@ -60,6 +169,31 @@ function mergeDefaultCategories(categories) {
   return { categories: missing.length ? [...list, ...missing] : list, added: missing.length };
 }
 
+/* A show saved by the rubric build has `judgeCount` and `headJudgeSlot` and
+   no teams. The Open system has no head judge — disagreement goes to the
+   Awards Committee Chairman, who stays outside the judging — so the old head
+   slot is dropped rather than translated. The old judgeCount becomes the
+   size of a single starter team covering every category, which is exactly
+   how a one-team show behaves anyway. */
+function migrateTeams(c) {
+  if (Array.isArray(c.teams) && c.teams.length) {
+    return c.teams.map((t, i) => ({
+      id: t.id || uid('team'),
+      name: t.name || `Team ${String.fromCharCode(65 + i)}`,
+      judgeCount: Number(t.judgeCount) === 2 ? 2 : 3,
+      judgeNames: Array.isArray(t.judgeNames) ? t.judgeNames : ['', '', ''],
+      categoryIds: Array.isArray(t.categoryIds) ? t.categoryIds : [],
+    }));
+  }
+  return [{
+    id: uid('team'),
+    name: 'Team A',
+    judgeCount: Number(c.judgeCount) === 2 ? 2 : 3,
+    judgeNames: ['', '', ''],
+    categoryIds: [],
+  }];
+}
+
 function normalizeConfig(c) {
   if (!c) return c;
   // A show configured before the default category list changed keeps
@@ -69,10 +203,16 @@ function normalizeConfig(c) {
   // won't pick that up on its own; mergeDefaultCategories adds whichever
   // default names are missing instead of requiring a manual Settings edit.
   const { categories } = mergeDefaultCategories(c.categories);
+  const teams = migrateTeams(c);
+  const known = new Set(categories.map((cat) => cat.id));
   return {
-    judgeCount: 3, headJudgeSlot: 1, showTheme: DEFAULT_SHOW_THEME, specialAwards: {},
+    showTheme: DEFAULT_SHOW_THEME, specialAwards: {}, chairmanName: '',
     ...c,
     categories,
+    // A category assigned to a team and later deleted would otherwise leave a
+    // dangling id that quietly counts as "assigned" and hides the category
+    // from every other team.
+    teams: teams.map((t) => ({ ...t, categoryIds: (t.categoryIds || []).filter((id) => known.has(id)) })),
   };
 }
 
@@ -197,15 +337,6 @@ function GlobalStyles() {
         .printdoc table { width: 100%; border-collapse: collapse; font-size: 9.5pt; margin-bottom: 4pt; }
         .printdoc th { text-align: left; border-bottom: 1pt solid #000; padding: 4pt 6pt; font-family: 'JetBrains Mono', monospace; font-size: 8pt; text-transform: uppercase; letter-spacing: .08em; }
         .printdoc td { padding: 4pt 6pt; border-bottom: 0.5pt solid #ccc; vertical-align: top; }
-        /* Keep a category's heading and its tier rows on one page where the
-           block will fit — a heading stranded at the foot of a page reads as
-           an empty category. Long categories still break normally. */
-        .printdoc .catblock { page-break-inside: avoid; break-inside: avoid; margin-bottom: 6pt; }
-        .printdoc td.tiername {
-          font-family: 'Oswald', sans-serif; font-size: 9.5pt; text-transform: uppercase;
-          letter-spacing: .08em; padding-top: 8pt; border-bottom: 0.75pt solid #000;
-        }
-        .printdoc .catcount { font-family: 'JetBrains Mono', monospace; font-size: 8pt; color: #444; }
 
         /* full-page table sign: legible from a few feet away, meant to
            stand alone on an easel or lie flat on the registration table.
@@ -407,61 +538,66 @@ function QrScanner({ onDetect, onClose, title }) {
   );
 }
 
-/* --------------------------- tier + score display --------------------------- */
+/* -------------------------- medal + points display -------------------------- */
 
-const TIER_STYLE = {
+const MEDAL_STYLE = {
   gold: 'bg-amber-50 text-amber-700 border-amber-300',
   silver: 'bg-slate-100 text-slate-600 border-slate-300',
   bronze: 'bg-orange-50 text-orange-800 border-orange-300',
-  merit: 'bg-slate-50 text-slate-500 border-slate-300',
   none: 'bg-white text-slate-400 border-slate-200 border-dashed',
 };
-const TIER_BAR_COLOR = {
-  gold: '#b45309', silver: '#64748b', bronze: '#9a3412', merit: '#475569', none: '#cbd5e1',
+const MEDAL_COLOR = {
+  gold: '#b45309', silver: '#64748b', bronze: '#9a3412', none: '#cbd5e1',
 };
-/* Merit → Bronze → Silver → Gold: awards are read out ascending, so both the
-   Organizer's tier summary and the printed results sheet list them in the
-   order they get announced. Reverse this array to lead with Gold instead —
-   it changes both places at once, which is the point of sharing it. */
-const TIER_PRINT_ORDER = ['merit', 'bronze', 'silver', 'gold'];
 
-function TierChip({ tier, size = 'md' }) {
-  if (!tier) return <span className="text-xs text-slate-400">Unjudged</span>;
+function MedalChip({ medal, size = 'md', provisional = false }) {
+  if (!medal) return <span className="text-xs text-slate-400">Unjudged</span>;
   const pad = size === 'sm' ? 'px-1.5 py-0.5 text-[11px]' : 'px-2 py-0.5 text-xs';
-  return <span className={`font-semibold rounded-full border ${pad} ${TIER_STYLE[tier.key]}`}>{tier.name}</span>;
+  return (
+    <span className={`font-semibold rounded-full border ${pad} ${MEDAL_STYLE[medal.key]} ${provisional ? 'opacity-60' : ''}`}>
+      {medal.name}{provisional ? '?' : ''}
+    </span>
+  );
 }
 
-function ScoreMeter({ result }) {
-  const notches = TIERS.filter((t) => t.key !== 'none').map((t) => t.min).reverse();
-  const pct = result.score ?? 0;
-  const color = TIER_BAR_COLOR[result.finalTier?.key || 'none'];
+/* Points out of the panel maximum, with the medal bands marked. The bands
+   move with panel size — 12 points across three judges, 8 across two — so
+   the meter reads its notches off the band table rather than hard-coding
+   them. */
+function PointsMeter({ result }) {
+  const b = { gold: null, silver: null, bronze: null };
+  const bands = MEDAL_BANDS[result.expected] || MEDAL_BANDS[3];
+  b.gold = bands.gold; b.silver = bands.silver; b.bronze = bands.bronze;
+  const max = result.max;
+  const pct = max ? (result.total / max) * 100 : 0;
+  const color = MEDAL_COLOR[(result.finalMedal || result.provisionalMedal)?.key || 'none'];
   return (
     <div>
       <div className="relative h-6 rounded bg-slate-100 border border-slate-200 overflow-hidden">
-        {result.score !== null && (
-          <div className="absolute inset-y-0 left-0" style={{ width: `${pct}%`, background: color, opacity: 0.85 }} />
-        )}
-        {notches.map((n) => (
-          <div key={n} className="absolute inset-y-0 w-px bg-white/70" style={{ left: `${n}%` }} />
+        <div className="absolute inset-y-0 left-0" style={{ width: `${pct}%`, background: color, opacity: 0.85 }} />
+        {[b.bronze, b.silver, b.gold].map((n) => (
+          <div key={n} className="absolute inset-y-0 w-px bg-white/70" style={{ left: `${(n / max) * 100}%` }} />
         ))}
-        {result.score !== null && (
-          <span className="absolute inset-0 flex items-center justify-end pr-2 sb-mono text-xs font-semibold text-slate-900">
-            {result.score}
-          </span>
-        )}
+        <span className="absolute inset-0 flex items-center justify-end pr-2 sb-mono text-xs font-semibold text-slate-900">
+          {result.total} / {max}
+        </span>
       </div>
       <div className="flex justify-between sb-mono text-[9.5px] text-slate-400 mt-0.5">
-        <span>0</span><span>Merit 50</span><span>Bronze 65</span><span>Silver 76</span><span>Gold 86</span><span>100</span>
+        <span>0</span>
+        <span>Bronze {b.bronze}</span>
+        <span>Silver {b.silver}</span>
+        <span>Gold {b.gold}</span>
+        <span>{max}</span>
       </div>
     </div>
   );
 }
 
 function FlagNote({ flag }) {
-  const calm = flag.key === 'confirmed' || flag.key === 'unjudged';
+  const calm = flag.key === 'ruled';
   return (
     <div className={`text-xs rounded p-2 mt-2 ${calm ? 'bg-teal-50 text-teal-800' : 'bg-amber-50 text-amber-800'}`}>
-      <strong>{flagLabel(flag.key)}</strong> — {flag.text}{reconciliationText(flag.key)}
+      <strong>{flagLabel(flag.key)}</strong> — {flag.text}
     </div>
   );
 }
@@ -482,7 +618,53 @@ function RoleCard({ icon: Icon, title, desc, onClick, accent }) {
   );
 }
 
-function Landing({ config, entries, onNav }) {
+function MyEntriesPanel({ config, entries, onPrintTag }) {
+  const [mine, setMine] = useState(readMyEntries);
+  // Match on id, then fall back to the entry number — an entry deleted and
+  // re-added by the desk keeps its number but not its id.
+  const found = mine
+    .map((m) => entries.find((e) => e.id === m.id) || entries.find((e) => e.number === m.number))
+    .filter(Boolean);
+  if (found.length === 0) return null;
+
+  const clear = () => { forgetMyEntries(); setMine([]); };
+
+  return (
+    <div className="max-w-3xl mx-auto px-4 pb-6">
+      <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-sm">
+        <div className="flex items-center justify-between mb-2 gap-2">
+          <h3 className="font-semibold text-slate-900 text-sm">Your entries</h3>
+          <button onClick={clear} className="text-xs text-slate-400 hover:text-slate-600 underline shrink-0">
+            Not you? Clear
+          </button>
+        </div>
+        <p className="text-xs text-slate-500 mb-3">
+          Registered from this device. Lost your tag? Reprint it here, or ask at the registration desk.
+        </p>
+        <div className="space-y-2">
+          {found.map((e) => (
+            <div key={e.id} className="flex items-center gap-3 border border-slate-100 rounded-lg p-2.5">
+              <EntryBadge number={e.number} size="sm" />
+              <div className="flex-1 min-w-0">
+                <p className="font-medium text-slate-900 truncate text-sm">{e.modelName}</p>
+                <p className="text-xs text-slate-500 truncate">
+                  {categoryName(config, e.categoryId)}
+                  {e.checkedIn ? <span className="text-teal-700 font-semibold"> · Checked in</span> : ''}
+                </p>
+              </div>
+              <QrCode value={entryQrPayload(e.number)} size={40} className="shrink-0 rounded border border-slate-200" />
+              <button onClick={() => onPrintTag(e)} aria-label={`Print tag for entry ${e.number}`} className="shrink-0 p-2 text-slate-400 hover:text-slate-700">
+                <Printer size={15} />
+              </button>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Landing({ config, entries, onNav, onPrintTag }) {
   const total = entries.length;
   const checkedIn = entries.filter((e) => e.checkedIn).length;
   return (
@@ -501,9 +683,10 @@ function Landing({ config, entries, onNav }) {
       <div className="max-w-3xl mx-auto px-4 pb-6 grid sm:grid-cols-2 gap-4">
         <RoleCard icon={UserPlus} title="Register an Entry" desc="Sign up your model for the show." onClick={() => onNav('register')} accent="amber" />
         <RoleCard icon={ClipboardCheck} title="Registration Desk" desc="Check in entries, add walk-ins, print tags." onClick={() => onNav('desk')} accent="teal" />
-        <RoleCard icon={ListChecks} title="Judging" desc="Score entries against the rubric." onClick={() => onNav('judge')} accent="teal" />
+        <RoleCard icon={ListChecks} title="Judging" desc="Score entries with your team." onClick={() => onNav('judge')} accent="teal" />
         <RoleCard icon={Settings} title="Organizer Console" desc="Categories, awards, and results." onClick={() => onNav('organizer')} accent="teal" />
       </div>
+      <MyEntriesPanel config={config} entries={entries} onPrintTag={onPrintTag} />
       {config.status === 'published' && (
         <div className="max-w-3xl mx-auto px-4 pb-16">
           <button onClick={() => onNav('results')} className="w-full flex items-center justify-center gap-2 bg-amber-500 hover:bg-amber-400 text-slate-900 font-semibold rounded-xl py-3 transition">
@@ -523,8 +706,12 @@ function SetupWizard({ initial, onSave, onCancel, isEdit }) {
   const [date, setDate] = useState(initial?.date || '');
   const [location, setLocation] = useState(initial?.location || '');
   const [adminPin, setAdminPin] = useState(initial?.adminPin || '');
-  const [judgeCount, setJudgeCount] = useState(initial?.judgeCount || 3);
-  const [headJudgeSlot, setHeadJudgeSlot] = useState(initial?.headJudgeSlot || 1);
+  const [chairmanName, setChairmanName] = useState(initial?.chairmanName || '');
+  const [teams, setTeams] = useState(() => (
+    initial?.teams?.length
+      ? initial.teams.map((t) => ({ ...t, judgeNames: [...(t.judgeNames || ['', '', ''])] }))
+      : [{ id: uid('team'), name: 'Team A', judgeCount: 3, judgeNames: ['', '', ''], categoryIds: [] }]
+  ));
   const [showTheme, setShowTheme] = useState(initial?.showTheme ?? DEFAULT_SHOW_THEME);
   const [categories, setCategories] = useState(
     initial?.categories?.length ? initial.categories : DEFAULT_CATEGORIES.map((n) => ({ id: uid('cat'), name: n }))
@@ -534,6 +721,29 @@ function SetupWizard({ initial, onSave, onCancel, isEdit }) {
   const updateCat = (idx, value) => setCategories((cs) => cs.map((c, i) => (i === idx ? { ...c, name: value } : c)));
   const addCat = () => setCategories((cs) => [...cs, { id: uid('cat'), name: '' }]);
   const removeCat = (idx) => setCategories((cs) => cs.filter((_, i) => i !== idx));
+
+  const patchTeam = (id, patch) => setTeams((ts) => ts.map((t) => (t.id === id ? { ...t, ...patch } : t)));
+  const addTeam = () => setTeams((ts) => [...ts, {
+    id: uid('team'),
+    name: `Team ${String.fromCharCode(65 + ts.length)}`,
+    judgeCount: 3, judgeNames: ['', '', ''], categoryIds: [],
+  }]);
+  const removeTeam = (id) => setTeams((ts) => (ts.length > 1 ? ts.filter((t) => t.id !== id) : ts));
+  const setJudgeName = (id, idx, value) => setTeams((ts) => ts.map((t) => {
+    if (t.id !== id) return t;
+    const names = [...(t.judgeNames || ['', '', ''])];
+    names[idx] = value;
+    return { ...t, judgeNames: names };
+  }));
+  // A category belongs to at most one team. Ticking it for a second team
+  // moves it rather than duplicating it, so no group is ever owned twice.
+  const toggleTeamCategory = (id, catId) => setTeams((ts) => ts.map((t) => {
+    const has = (t.categoryIds || []).includes(catId);
+    if (t.id === id) {
+      return { ...t, categoryIds: has ? t.categoryIds.filter((x) => x !== catId) : [...(t.categoryIds || []), catId] };
+    }
+    return has ? { ...t, categoryIds: t.categoryIds.filter((x) => x !== catId) } : t;
+  }));
 
   const canSave = name.trim() && adminPin.trim().length >= 4 && categories.some((c) => c.name.trim());
 
@@ -545,8 +755,13 @@ function SetupWizard({ initial, onSave, onCancel, isEdit }) {
       date,
       location: location.trim(),
       adminPin: adminPin.trim(),
-      judgeCount: Number(judgeCount),
-      headJudgeSlot: Math.min(Number(headJudgeSlot), Number(judgeCount)),
+      chairmanName: chairmanName.trim(),
+      teams: teams.map((t) => ({
+        ...t,
+        name: (t.name || '').trim() || 'Team',
+        judgeCount: Number(t.judgeCount) === 2 ? 2 : 3,
+        judgeNames: (t.judgeNames || []).map((n) => (n || '').trim()),
+      })),
       showTheme: showTheme.trim(),
       categories: categories.filter((c) => c.name.trim()).map((c) => ({ ...c, name: c.name.trim() })),
       status: initial?.status || 'open',
@@ -579,24 +794,82 @@ function SetupWizard({ initial, onSave, onCancel, isEdit }) {
       </div>
 
       <div className="border border-slate-200 rounded-lg p-4 bg-white mb-6">
-        <h3 className="font-semibold text-slate-800 mb-1 text-sm">Judging panel</h3>
+        <h3 className="font-semibold text-slate-800 mb-1 text-sm">Awards Committee Chairman</h3>
         <p className="text-xs text-slate-500 mb-3">
-          Three criteria at 0–100 either way — panel size only changes how disagreement between judges gets resolved.
+          Supervises the judging and has the final say on any disagreement or tie. He stays outside the judging
+          teams — that detachment is what qualifies him to arbitrate, so he never scores as a judge.
         </p>
-        <div className="grid sm:grid-cols-2 gap-4">
-          <Field label="Judges per entry">
-            <select className="sb-input" value={judgeCount} onChange={(e) => setJudgeCount(e.target.value)}>
-              <option value={3}>3 — standard panel</option>
-              <option value={2}>2 — reduced panel</option>
-            </select>
-          </Field>
-          <Field label="Head judge">
-            <select className="sb-input" value={headJudgeSlot} onChange={(e) => setHeadJudgeSlot(e.target.value)}>
-              {Array.from({ length: Number(judgeCount) }, (_, i) => i + 1).map((s) => (
-                <option key={s} value={s}>Judge {s}</option>
-              ))}
-            </select>
-          </Field>
+        <Field label="Chairman's name">
+          <input value={chairmanName} onChange={(e) => setChairmanName(e.target.value)} className="sb-input" placeholder="Optional — recorded against any ruling" />
+        </Field>
+      </div>
+
+      <div className="border border-slate-200 rounded-lg p-4 bg-white mb-6">
+        <div className="flex items-center justify-between mb-1">
+          <h3 className="font-semibold text-slate-800 text-sm">Judging teams</h3>
+          <button onClick={addTeam} className="text-sm flex items-center gap-1 text-teal-700 hover:text-teal-800 font-medium">
+            <Plus size={15} /> Add team
+          </button>
+        </div>
+        <p className="text-xs text-slate-500 mb-3">
+          A team is normally three judges; two is supported as a reduced panel and shifts the medal bands
+          accordingly. Give each judge a name and the app can stop them scoring their own work. Assign each team
+          the categories it covers — a category left unassigned is open to every team.
+        </p>
+        <div className="space-y-4">
+          {teams.map((t) => (
+            <div key={t.id} className="border border-slate-200 rounded-lg p-3">
+              <div className="flex gap-2 items-end mb-3">
+                <div className="flex-1">
+                  <Field label="Team name">
+                    <input className="sb-input" value={t.name} onChange={(e) => patchTeam(t.id, { name: e.target.value })} />
+                  </Field>
+                </div>
+                <div className="w-32">
+                  <Field label="Judges">
+                    <select className="sb-input" value={t.judgeCount} onChange={(e) => patchTeam(t.id, { judgeCount: Number(e.target.value) })}>
+                      <option value={3}>3 — standard</option>
+                      <option value={2}>2 — reduced</option>
+                    </select>
+                  </Field>
+                </div>
+                {teams.length > 1 && (
+                  <button onClick={() => removeTeam(t.id)} aria-label="Remove team" className="p-2 mb-1 text-slate-400 hover:text-red-600 shrink-0">
+                    <Trash2 size={16} />
+                  </button>
+                )}
+              </div>
+              <p className="text-xs font-medium text-slate-500 mb-1">Judges on this team</p>
+              <div className="grid sm:grid-cols-3 gap-2 mb-3">
+                {Array.from({ length: Number(t.judgeCount) }, (_, i) => i).map((i) => (
+                  <input
+                    key={i}
+                    className="sb-input"
+                    placeholder={`Judge ${i + 1} name`}
+                    value={(t.judgeNames || [])[i] || ''}
+                    onChange={(e) => setJudgeName(t.id, i, e.target.value)}
+                  />
+                ))}
+              </div>
+              <p className="text-xs font-medium text-slate-500 mb-1">
+                Categories ({(t.categoryIds || []).length || 'none — open to all teams'})
+              </p>
+              <div className="flex flex-wrap gap-1.5">
+                {categories.filter((c) => c.name.trim()).map((c) => {
+                  const on = (t.categoryIds || []).includes(c.id);
+                  return (
+                    <button
+                      key={c.id}
+                      onClick={() => toggleTeamCategory(t.id, c.id)}
+                      className={`text-xs px-2 py-1 rounded border ${on ? 'bg-slate-900 text-white border-slate-900' : 'bg-white text-slate-600 border-slate-300 hover:border-slate-400'}`}
+                    >
+                      {c.name}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          ))}
         </div>
       </div>
 
@@ -644,7 +917,7 @@ function SetupWizard({ initial, onSave, onCancel, isEdit }) {
 
 /* ------------------------------- register / desk ------------------------------- */
 
-function RegisterView({ config, onSubmit, onPrintTag }) {
+function RegisterView({ config, onSubmit, onPrintTag, remember = true }) {
   const firstCat = config.categories[0];
   const [form, setForm] = useState({
     name: '', contact: '', modelName: '',
@@ -663,6 +936,7 @@ function RegisterView({ config, onSubmit, onPrintTag }) {
     setErr('');
     try {
       const entry = await onSubmit(form);
+      if (remember) rememberMyEntry(entry);
       setConfirmed(entry);
     } catch (e2) {
       setErr('Could not save your entry — please try again.');
@@ -687,7 +961,13 @@ function RegisterView({ config, onSubmit, onPrintTag }) {
             <Printer size={16} /> Print my tag
           </button>
         )}
-        <p className="text-slate-400 text-xs mb-6">Or ask staff to print it for you and set it beside your model.</p>
+        <p className="text-slate-400 text-xs mb-2">Or ask staff to print it for you and set it beside your model.</p>
+        {remember && (
+          <p className="text-slate-400 text-xs mb-6">
+            This device will remember your entries — find them again under “Your entries” on the home page. On a
+            different device, the registration desk can look you up and reprint.
+          </p>
+        )}
         <button onClick={() => setConfirmed(null)} className="text-teal-700 font-medium text-sm">
           Register another entry
         </button>
@@ -760,7 +1040,7 @@ function DeskView({ config, entries, onCheckIn, onWalkIn, onPrintTags, notify })
             <ArrowLeft size={14} /> Back to desk
           </button>
         </div>
-        <RegisterView config={config} onSubmit={(form) => onWalkIn(form)} onPrintTag={(entry) => onPrintTags([entry])} />
+        <RegisterView config={config} onSubmit={(form) => onWalkIn(form)} onPrintTag={(entry) => onPrintTags([entry])} remember={false} />
       </div>
     );
   }
@@ -824,125 +1104,246 @@ function DeskView({ config, entries, onCheckIn, onWalkIn, onPrintTags, notify })
 
 /* ---------------------------------- judging ---------------------------------- */
 
-function JudgeSlotPicker({ config, slot, onChange }) {
-  const slots = Array.from({ length: config.judgeCount || 3 }, (_, i) => i + 1);
+function JudgeSeatPicker({ config, teamId, seat, onChange }) {
+  const teams = config.teams || [];
+  const team = teams.find((t) => t.id === teamId) || teams[0];
+  const seats = Array.from({ length: Number(team?.judgeCount) || 3 }, (_, i) => i + 1);
   return (
-    <div className="flex items-center gap-2 mb-4 bg-white border border-slate-200 rounded-lg p-2 flex-wrap">
-      <span className="text-xs font-semibold text-slate-500 pl-1 shrink-0">I am</span>
-      {slots.map((s) => (
-        <button
-          key={s}
-          onClick={() => onChange(s)}
-          className={`px-3 py-1.5 rounded-md text-sm font-semibold ${slot === s ? 'bg-slate-900 text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}
-        >
-          Judge {s}{s === config.headJudgeSlot ? ' · Head' : ''}
-        </button>
-      ))}
-    </div>
-  );
-}
-
-function CriterionInput({ crit, value, onChange }) {
-  return (
-    <div className="border-t border-slate-100 first:border-t-0 py-2">
-      <div className="flex items-center justify-between gap-3">
-        <label className="text-sm text-slate-700">
-          {crit.name} <span className="sb-mono text-xs text-slate-400">(0–{crit.max})</span>
-        </label>
-        <input
-          type="number"
-          min={0}
-          max={crit.max}
-          step={1}
-          inputMode="numeric"
-          aria-label={`${crit.name}, 0 to ${crit.max} points`}
-          className="sb-input sb-mono text-center w-20 py-1 shrink-0"
-          value={value ?? ''}
-          onChange={(e) => {
-            const raw = e.target.value;
-            const v = raw === '' ? null : Math.max(0, Math.min(crit.max, Math.round(Number(raw))));
-            onChange(v);
-          }}
-        />
+    <div className="bg-white border border-slate-200 rounded-lg p-2 mb-4 space-y-2">
+      {teams.length > 1 && (
+        <div className="flex items-center gap-2">
+          <span className="text-xs font-semibold text-slate-500 pl-1 shrink-0">My team</span>
+          <select className="sb-input flex-1" value={team?.id || ''} onChange={(e) => onChange(e.target.value, 1)}>
+            {teams.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
+          </select>
+        </div>
+      )}
+      <div className="flex items-center gap-2 flex-wrap">
+        <span className="text-xs font-semibold text-slate-500 pl-1 shrink-0">I am</span>
+        {seats.map((s) => {
+          const nm = (team?.judgeNames || [])[s - 1];
+          return (
+            <button
+              key={s}
+              onClick={() => onChange(team.id, s)}
+              className={`px-3 py-1.5 rounded-md text-sm font-semibold ${seat === s ? 'bg-slate-900 text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}
+            >
+              Judge {s}{nm ? ` · ${nm}` : ''}
+            </button>
+          );
+        })}
       </div>
-      <p className="text-xs text-slate-400 mt-0.5">{crit.hint}</p>
     </div>
   );
 }
 
-function JudgeEntryCard({ entry, config, mySlot, onScore, onHeadConfirm, categoryLabel, forceOpen }) {
+/* One mark, 0–4, for the whole piece or group. The six criteria are what the
+   judge weighs to arrive at this number — they are not scored separately. */
+function MarkInput({ value, onChange, disabled }) {
+  return (
+    <div className="flex gap-1.5">
+      {[0, 1, 2, 3, 4].map((v) => {
+        const guide = MARK_GUIDE.find((m) => m.value === v);
+        const on = value === v;
+        return (
+          <button
+            key={v}
+            disabled={disabled}
+            onClick={() => onChange(on ? null : v)}
+            aria-pressed={on}
+            className={`flex-1 rounded-lg border px-1 py-2 text-center disabled:opacity-40 disabled:cursor-not-allowed ${on ? 'bg-slate-900 text-white border-slate-900' : 'bg-white border-slate-300 hover:border-slate-400'}`}
+          >
+            <span className="sb-display block text-lg leading-none">{v}</span>
+            <span className={`block text-[10px] mt-0.5 ${on ? 'text-slate-300' : 'text-slate-500'}`}>{guide.short}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function CriteriaReminder() {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="mt-2">
+      <button onClick={() => setOpen((o) => !o)} className="text-xs text-teal-700 font-medium flex items-center gap-1">
+        {open ? <ChevronUp size={13} /> : <ChevronDown size={13} />} Judging criteria
+      </button>
+      {open && (
+        <ul className="mt-1.5 space-y-1">
+          {CRITERIA.map((c) => (
+            <li key={c.key} className="text-xs text-slate-500">
+              <span className="font-semibold text-slate-700">{c.name}</span> — {c.hint}
+            </li>
+          ))}
+          <li className="text-xs text-slate-400 italic pt-1">
+            In no particular order of importance or consideration. They inform one mark; they are not scored separately.
+          </li>
+        </ul>
+      )}
+    </div>
+  );
+}
+
+/* The team's selection decision for a multi-piece group. Taken together by
+   the team, not by any one judge — whoever records it is recording the
+   panel's call, which is why there is no head-judge gate on these buttons. */
+function ScopeChooser({ group, result, onSetScope }) {
+  const [picking, setPicking] = useState(false);
+  const count = group.entries.length;
+
+  if (result.scope === 'collection') {
+    return (
+      <div className="bg-teal-50 border border-teal-200 rounded p-2 mt-2 text-xs text-teal-900">
+        <strong>Whole collection judged.</strong> All {count} pieces take the same medal.
+        <button onClick={() => onSetScope(group.key, null, null)} className="ml-2 underline text-teal-700">Change</button>
+      </div>
+    );
+  }
+  if (result.scope === 'representative' && result.repEntryId) {
+    const rep = group.entries.find((e) => e.id === result.repEntryId);
+    return (
+      <div className="bg-teal-50 border border-teal-200 rounded p-2 mt-2 text-xs text-teal-900">
+        <strong>Representative piece:</strong> #{pad(rep?.number)} {rep?.modelName}. Judged as the best of {count};
+        only this piece takes the medal.
+        <button onClick={() => onSetScope(group.key, null, null)} className="ml-2 underline text-teal-700">Change</button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="bg-amber-50 border border-amber-200 rounded p-2.5 mt-2">
+      <p className="text-xs text-amber-900 font-semibold mb-1">Team decision needed</p>
+      <p className="text-xs text-amber-900 mb-2">
+        This exhibitor has {count} pieces in this category. Decide together: judge the single best piece as
+        representative of the group, or judge the whole collection as one and award them all the same medal.
+      </p>
+      {!picking ? (
+        <div className="flex gap-2 flex-wrap">
+          <button onClick={() => setPicking(true)} className="text-xs font-semibold bg-slate-900 text-white rounded px-2.5 py-1.5">
+            Pick one as representative
+          </button>
+          <button onClick={() => onSetScope(group.key, 'collection', null)} className="text-xs font-semibold bg-white border border-slate-300 text-slate-700 rounded px-2.5 py-1.5">
+            Award the whole collection
+          </button>
+        </div>
+      ) : (
+        <div className="space-y-1">
+          {group.entries.map((e) => (
+            <button
+              key={e.id}
+              onClick={() => { onSetScope(group.key, 'representative', e.id); setPicking(false); }}
+              className="w-full text-left text-xs bg-white border border-slate-300 hover:border-slate-500 rounded px-2 py-1.5"
+            >
+              <EntryBadgeInline number={e.number} /> {e.modelName}
+            </button>
+          ))}
+          <button onClick={() => setPicking(false)} className="text-xs text-slate-500 underline">Cancel</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function GroupCard({ group, config, record, teamId, seat, judgeName, onSetScope, onSetMark, categoryLabel, forceOpen }) {
   const [open, setOpen] = useState(false);
   useEffect(() => { if (forceOpen) setOpen(true); }, [forceOpen]);
 
-  const result = computeScore(entry.scores, config.judgeCount, entry.headConfirm);
-  const myMarks = entry.scores?.[mySlot] || {};
-  const myDone = CRITERIA.every((c) => myMarks[c.key] !== undefined && myMarks[c.key] !== null);
-  const revealOthers = myDone;
+  const judgeCount = judgeCountForGroup(config, group.categoryId);
+  const result = computeGroup(record, judgeCount, group.entries.map((e) => e.id));
+  const conflict = isOwnWork(judgeName, group.name);
+  const myMark = record?.marks?.[seat];
+  const myDone = myMark !== undefined && myMark !== null;
+  const revealOthers = myDone || conflict;
+  const anyNotCheckedIn = group.entries.some((e) => !e.checkedIn);
 
-  const setMark = (key, v) => onScore(entry.id, mySlot, { ...myMarks, [key]: v });
-
-  const isHead = mySlot === config.headJudgeSlot;
-  const hasBoundary = result.flags.some((f) => f.key === 'boundary');
-  const needsReview = result.flags.some((f) => ['reconcile', 'boundary', 'outlier'].includes(f.key));
+  const needsReview = result.flags.some((f) => ['unselected', 'spread'].includes(f.key));
+  const headline = result.scope === 'collection'
+    ? `Collection — ${group.entries.length} pieces`
+    : result.scope === 'representative' && result.repEntryId
+      ? group.entries.find((e) => e.id === result.repEntryId)?.modelName || group.entries[0].modelName
+      : group.entries.length > 1
+        ? `${group.entries.length} pieces — not yet selected`
+        : group.entries[0].modelName;
 
   return (
     <div className={`bg-white border rounded-lg overflow-hidden ${needsReview ? 'border-amber-300' : 'border-slate-200'} ${forceOpen ? 'ring-2 ring-amber-200' : ''}`}>
       <button onClick={() => setOpen((o) => !o)} className="w-full flex items-center gap-3 p-3 text-left">
-        <EntryBadge number={entry.number} size="sm" />
+        <EntryBadge number={group.entries[0].number} size="sm" />
         <div className="flex-1 min-w-0">
-          <p className="font-medium text-slate-900 truncate">{entry.modelName}</p>
+          <p className="font-medium text-slate-900 truncate">{headline}</p>
           <p className="text-xs text-slate-500 truncate">
-            {entry.name} · {categoryLabel}
-            {!entry.checkedIn && <span className="text-red-500 font-semibold uppercase ml-1">· Not in</span>}
+            {group.name} · {categoryLabel}
+            {anyNotCheckedIn && <span className="text-red-500 font-semibold uppercase ml-1">· Not all in</span>}
           </p>
         </div>
         <div className="text-right shrink-0">
-          <TierChip tier={result.finalTier} size="sm" />
+          <MedalChip medal={result.finalMedal} size="sm" />
           <p className="sb-mono text-[10px] text-slate-400 mt-0.5">
             {result.n}/{result.expected} in{myDone ? ' · yours in' : ''}
           </p>
         </div>
         {open ? <ChevronUp size={16} className="text-slate-400 shrink-0" /> : <ChevronDown size={16} className="text-slate-400 shrink-0" />}
       </button>
+
       {open && (
         <div className="px-3 pb-3 border-t border-slate-100">
-          {entry.notes && <p className="text-xs bg-slate-50 rounded p-2 my-2 whitespace-pre-wrap">{entry.notes}</p>}
-          <div className="mt-2">
-            <ScoreMeter result={result} />
+          <div className="mt-2 space-y-1.5">
+            {group.entries.map((e) => {
+              const isRep = result.scope === 'representative' && result.repEntryId === e.id;
+              const dimmed = result.scope === 'representative' && result.repEntryId && !isRep;
+              return (
+                <div key={e.id} className={`text-xs rounded p-2 ${dimmed ? 'bg-slate-50 text-slate-400' : 'bg-slate-50'}`}>
+                  <p className="font-medium">
+                    <EntryBadgeInline number={e.number} />
+                    {e.modelName}
+                    {isRep && <span className="ml-1 text-teal-700 font-semibold uppercase text-[10px]">· Representative</span>}
+                  </p>
+                  {e.notes && !dimmed && <p className="whitespace-pre-wrap mt-1 text-slate-600">{e.notes}</p>}
+                </div>
+              );
+            })}
           </div>
-          {result.flags.map((f) => <FlagNote key={f.key} flag={f} />)}
 
-          {isHead && hasBoundary && (
-            <div className="flex gap-2 mt-2">
-              <button onClick={() => onHeadConfirm(entry.id, 'up')} className="text-xs font-semibold bg-slate-900 text-white rounded px-2.5 py-1.5">
-                Move up a tier
-              </button>
-              <button onClick={() => onHeadConfirm(entry.id, 'hold')} className="text-xs font-semibold bg-slate-100 text-slate-700 rounded px-2.5 py-1.5">
-                Hold at {result.tier.name}
-              </button>
+          {result.needsScope && <ScopeChooser group={group} result={result} onSetScope={onSetScope} />}
+
+          {result.scopeSet && (
+            <div className="mt-3">
+              <PointsMeter result={result} />
             </div>
           )}
-          {isHead && entry.headConfirm && !hasBoundary && (
-            <button onClick={() => onHeadConfirm(entry.id, null)} className="text-xs text-slate-400 underline mt-2">
-              Undo head-judge decision
-            </button>
+          {result.flags.map((f) => <FlagNote key={f.key} flag={f} />)}
+
+          {conflict ? (
+            <div className="text-xs rounded p-2 mt-3 bg-red-50 text-red-800">
+              <strong>{flagLabel('conflict')}</strong> — this is your own work. Judges do not judge their own
+              entries; another judge on the team scores this one.
+            </div>
+          ) : (
+            <div className="mt-3">
+              <p className="text-xs font-semibold text-slate-500 mb-1.5">
+                Your mark — Judge {seat}{' '}
+                <span className="font-normal text-slate-400">(one number, 0–{MAX_PER_JUDGE}, for the whole {result.scope === 'collection' ? 'collection' : 'piece'})</span>
+              </p>
+              <MarkInput
+                value={myMark ?? null}
+                disabled={!result.scopeSet}
+                onChange={(v) => onSetMark(group.key, seat, v, teamId)}
+              />
+              {!result.scopeSet && (
+                <p className="text-xs text-slate-400 mt-1.5">Make the selection decision above before scoring.</p>
+              )}
+              <CriteriaReminder />
+            </div>
           )}
 
-          <div className="mt-3">
-            <p className="text-xs font-semibold text-slate-500 mb-1">
-              Your marks — Judge {mySlot} <span className="font-normal text-slate-400">(points per line add up to 100)</span>
-            </p>
-            {CRITERIA.map((c) => (
-              <CriterionInput key={c.key} crit={c} value={myMarks[c.key]} onChange={(v) => setMark(c.key, v)} />
-            ))}
-          </div>
-
-          {revealOthers && result.judgeScores.length > 0 && (
+          {revealOthers && result.marks.length > 0 && (
             <div className="mt-3 pt-3 border-t border-slate-100">
               <p className="text-xs font-semibold text-slate-500 mb-1">All judges</p>
-              {result.judgeScores.map((j) => (
-                <p key={j.slot} className="text-xs text-slate-600 sb-mono">Judge {j.slot}: {fmt1(j.score)}</p>
+              {result.marks.map((m) => (
+                <p key={m.slot} className="text-xs text-slate-600 sb-mono">Judge {m.slot}: {m.value}</p>
               ))}
+              <p className="text-xs text-slate-500 sb-mono mt-1">Total: {fmtPoints(result.total, result.max)}</p>
             </div>
           )}
           {!revealOthers && result.n > 0 && (
@@ -956,36 +1357,71 @@ function JudgeEntryCard({ entry, config, mySlot, onScore, onHeadConfirm, categor
   );
 }
 
-function JudgeView({ config, entries, onScore, onHeadConfirm, notify }) {
-  const [mySlot, setMySlot] = useState(() => {
-    const saved = Number(localStorage.getItem('brushscore:judgeSlot'));
-    return saved >= 1 && saved <= (config.judgeCount || 3) ? saved : 1;
+function JudgeView({ config, entries, groupRecords, onSetScope, onSetMark, notify }) {
+  const teams = config.teams || [];
+  const [teamId, setTeamId] = useState(() => {
+    const saved = localStorage.getItem('brushscore:teamId');
+    return teams.some((t) => t.id === saved) ? saved : teams[0]?.id;
   });
+  const [seat, setSeat] = useState(() => {
+    const saved = Number(localStorage.getItem('brushscore:judgeSeat'));
+    return saved >= 1 && saved <= 3 ? saved : 1;
+  });
+
+  const team = teams.find((t) => t.id === teamId) || teams[0];
+
   useEffect(() => {
-    if (mySlot > config.judgeCount) setMySlot(1);
-    localStorage.setItem('brushscore:judgeSlot', String(mySlot));
+    // A team removed or shrunk in Settings must not leave this device
+    // pointing at a seat that no longer exists.
+    if (!teams.some((t) => t.id === teamId) && teams[0]) setTeamId(teams[0].id);
+    else if (team && seat > Number(team.judgeCount)) setSeat(1);
+    localStorage.setItem('brushscore:teamId', String(teamId || ''));
+    localStorage.setItem('brushscore:judgeSeat', String(seat));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mySlot, config.judgeCount]);
+  }, [teamId, seat, teams.length, team?.judgeCount]);
+
+  const judgeName = (team?.judgeNames || [])[seat - 1] || '';
 
   const [categoryId, setCategoryId] = useState('all');
   const [jump, setJump] = useState('');
   const [highlight, setHighlight] = useState(null);
   const [scanning, setScanning] = useState(false);
 
-  const list = entries.filter((e) => categoryId === 'all' || e.categoryId === categoryId).sort((a, b) => a.number - b.number);
-  const judgedCount = list.filter((e) => computeScore(e.scores, config.judgeCount, e.headConfirm).n >= Math.min(2, config.judgeCount)).length;
+  // Only the categories this team covers. A category assigned to no team is
+  // open to every team rather than invisible to all of them.
+  const myCategories = config.categories.filter((c) => {
+    const owner = teamForCategory(config, c.id);
+    return !owner || owner.id === team?.id;
+  });
+  const myCatIds = new Set(myCategories.map((c) => c.id));
 
-  const jumpToEntry = (found) => {
-    if (!found) return;
-    setCategoryId(found.categoryId);
-    setHighlight(found.id);
+  const groups = buildGroups(entries)
+    .filter((g) => myCatIds.has(g.categoryId))
+    .filter((g) => categoryId === 'all' || g.categoryId === categoryId);
+
+  const done = groups.filter((g) => {
+    const r = computeGroup(groupRecords[g.key], judgeCountForGroup(config, g.categoryId), g.entries.map((e) => e.id));
+    return r.complete && r.scopeSet;
+  }).length;
+
+  const jumpToGroup = (g) => {
+    if (!g) return;
+    setCategoryId(g.categoryId);
+    setHighlight(g.key);
     setTimeout(() => setHighlight(null), 2500);
+  };
+
+  const findGroupByNumber = (number) => {
+    const entry = entries.find((e) => e.number === number);
+    if (!entry) return null;
+    return buildGroups(entries).find((g) => g.entries.some((e) => e.id === entry.id)) || null;
   };
 
   const doJump = (e) => {
     e.preventDefault();
-    const found = entries.find((en) => String(en.number) === jump.trim());
-    if (found) jumpToEntry(found);
+    const g = findGroupByNumber(Number(jump.trim()));
+    if (g && myCatIds.has(g.categoryId)) jumpToGroup(g);
+    else if (g) notify('That entry belongs to another team\u2019s category.', 'error');
     setJump('');
   };
 
@@ -993,22 +1429,30 @@ function JudgeView({ config, entries, onScore, onHeadConfirm, notify }) {
     setScanning(false);
     const number = parseEntryQr(text);
     if (number == null) { notify("That code isn't a BrushScore entry.", 'error'); return; }
-    const found = entries.find((en) => en.number === number);
-    if (!found) { notify(`No entry found for #${number}.`, 'error'); return; }
-    jumpToEntry(found);
+    const g = findGroupByNumber(number);
+    if (!g) { notify(`No entry found for #${number}.`, 'error'); return; }
+    if (!myCatIds.has(g.categoryId)) { notify('That entry belongs to another team\u2019s category.', 'error'); return; }
+    jumpToGroup(g);
   };
 
   return (
     <div className="max-w-2xl mx-auto px-4 py-6">
       <h2 className="sb-display text-2xl mb-1">Judging</h2>
-      <p className="text-slate-500 text-sm mb-3">{judgedCount} of {list.length} have a standing tier in this view</p>
+      <p className="text-slate-500 text-sm mb-3">
+        {done} of {groups.length} fully marked in this view
+      </p>
 
-      <JudgeSlotPicker config={config} slot={mySlot} onChange={setMySlot} />
+      <JudgeSeatPicker
+        config={config}
+        teamId={team?.id}
+        seat={seat}
+        onChange={(tid, s) => { setTeamId(tid); setSeat(s); }}
+      />
 
       <div className="flex gap-2 mb-4">
         <select className="sb-input flex-1" value={categoryId} onChange={(e) => setCategoryId(e.target.value)}>
-          <option value="all">All categories</option>
-          {config.categories.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+          <option value="all">All my categories</option>
+          {myCategories.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
         </select>
         <form onSubmit={doJump} className="flex gap-1">
           <input className="sb-input sb-mono w-20" placeholder="Entry #" value={jump} onChange={(e) => setJump(e.target.value)} />
@@ -1020,17 +1464,20 @@ function JudgeView({ config, entries, onScore, onHeadConfirm, notify }) {
       </div>
 
       <div className="space-y-2">
-        {list.length === 0 && <p className="text-slate-400 text-sm text-center py-10">No entries in this category yet.</p>}
-        {list.map((e) => (
-          <JudgeEntryCard
-            key={e.id}
-            entry={e}
+        {groups.length === 0 && <p className="text-slate-400 text-sm text-center py-10">Nothing to judge in this view yet.</p>}
+        {groups.map((g) => (
+          <GroupCard
+            key={g.key}
+            group={g}
             config={config}
-            mySlot={mySlot}
-            onScore={onScore}
-            onHeadConfirm={onHeadConfirm}
-            categoryLabel={categoryName(config, e.categoryId)}
-            forceOpen={highlight === e.id}
+            record={groupRecords[g.key]}
+            teamId={team?.id}
+            seat={seat}
+            judgeName={judgeName}
+            onSetScope={onSetScope}
+            onSetMark={onSetMark}
+            categoryLabel={categoryName(config, g.categoryId)}
+            forceOpen={highlight === g.key}
           />
         ))}
       </div>
@@ -1076,12 +1523,12 @@ function CopyLinkRow({ label, view }) {
   );
 }
 
-function OverviewTab({ config, entries, onPublishToggle }) {
+function OverviewTab({ config, entries, groupRecords, onPublishToggle }) {
   const total = entries.length;
   const checkedIn = entries.filter((e) => e.checkedIn).length;
-  const results = entries.map((e) => computeScore(e.scores, config.judgeCount, e.headConfirm));
-  const judged = results.filter((r) => r.n >= Math.min(2, config.judgeCount)).length;
-  const needsReview = results.filter((r) => r.flags.some((f) => ['reconcile', 'boundary', 'outlier'].includes(f.key))).length;
+  const { rows } = buildAwards(entries, groupRecords, config);
+  const judged = rows.filter((r) => r.result.complete && r.result.scopeSet).length;
+  const needsReview = rows.filter((r) => r.result.flags.some((f) => ['unselected', 'spread'].includes(f.key))).length;
   const byCategory = config.categories.map((c) => ({ ...c, count: entries.filter((e) => e.categoryId === c.id).length }));
   const maxCount = Math.max(1, ...byCategory.map((c) => c.count));
 
@@ -1090,8 +1537,8 @@ function OverviewTab({ config, entries, onPublishToggle }) {
       <div className="grid grid-cols-4 gap-3">
         <StatCard label="Entries" value={total} />
         <StatCard label="Checked in" value={checkedIn} />
-        <StatCard label="Judged" value={judged} />
-        <StatCard label="Needs review" value={needsReview} />
+        <StatCard label={`Groups judged (of ${rows.length})`} value={judged} />
+        <StatCard label="Chairman review" value={needsReview} />
       </div>
       <div>
         <h3 className="font-semibold text-slate-800 mb-2 text-sm">Entries by category</h3>
@@ -1133,8 +1580,9 @@ function OverviewTab({ config, entries, onPublishToggle }) {
   );
 }
 
-function EntriesTab({ config, entries, onUpdateEntry, onDeleteEntry }) {
+function EntriesTab({ config, entries, groupRecords, onUpdateEntry, onDeleteEntry }) {
   const [q, setQ] = useState('');
+  const { byEntry } = buildAwards(entries, groupRecords, config);
   const filtered = entries
     .filter((e) => {
       const s = q.toLowerCase();
@@ -1150,15 +1598,18 @@ function EntriesTab({ config, entries, onUpdateEntry, onDeleteEntry }) {
       </div>
       <div className="space-y-2">
         {filtered.map((e) => {
-          const result = computeScore(e.scores, config.judgeCount, e.headConfirm);
+          const row = byEntry.get(e.id);
+          const note = row ? awardScopeNote(row) : '';
           return (
             <div key={e.id} className="bg-white border border-slate-200 rounded-lg p-3 flex items-center gap-3 flex-wrap">
               <EntryBadge number={e.number} size="sm" />
               <div className="flex-1 min-w-0">
                 <p className="font-medium text-slate-900 truncate">{e.modelName}</p>
-                <p className="text-xs text-slate-500 truncate">{e.name}{e.contact ? ` · ${e.contact}` : ''}</p>
+                <p className="text-xs text-slate-500 truncate">
+                  {e.name}{e.contact ? ` · ${e.contact}` : ''}{note ? ` · ${note}` : ''}
+                </p>
               </div>
-              <TierChip tier={result.finalTier} size="sm" />
+              <MedalChip medal={row ? row.result.finalMedal : null} size="sm" />
               <select className="sb-input text-xs w-40" value={e.categoryId} onChange={(ev) => onUpdateEntry(e.id, { categoryId: ev.target.value })}>
                 {config.categories.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
               </select>
@@ -1174,76 +1625,62 @@ function EntriesTab({ config, entries, onUpdateEntry, onDeleteEntry }) {
   );
 }
 
-/* Shared by the Organizer's tier summary and the printed results sheet:
-   bucket entries by category in Settings order, then by tier within each.
-   An entry whose categoryId no longer resolves — its category was deleted
-   after the entry was registered — would otherwise drop out of both views
-   silently, so those are swept into a trailing Uncategorized bucket. */
-function groupByCategoryThenTier(config, entries) {
-  const scored = entries.map((e) => ({ e, r: computeScore(e.scores, config.judgeCount, e.headConfirm) }));
-  const known = new Set(config.categories.map((c) => c.id));
-  const buckets = config.categories.map((c) => ({ id: c.id, name: c.name, inCat: scored.filter((x) => x.e.categoryId === c.id) }));
-  const orphans = scored.filter((x) => !known.has(x.e.categoryId));
-  if (orphans.length) buckets.push({ id: '__none', name: 'Uncategorized', inCat: orphans });
-
-  return buckets
-    .filter((b) => b.inCat.length > 0)
-    .map((b) => ({
-      ...b,
-      tiers: TIER_PRINT_ORDER
-        .map((key) => ({
-          t: TIERS.find((tt) => tt.key === key),
-          items: b.inCat.filter((x) => x.r.finalTier?.key === key).sort((a, b2) => b2.r.score - a.r.score),
-        }))
-        .filter((g) => g.t && g.items.length > 0),
-      unplaced: b.inCat.filter((x) => !x.r.finalTier || x.r.finalTier.key === 'none'),
-    }));
-}
-
-function TierSummary({ config, entries }) {
-  const sections = groupByCategoryThenTier(config, entries);
-
-  if (sections.length === 0) return <p className="text-xs text-slate-400 mb-6">No entries yet.</p>;
+/* Medals are listed by group, not by entry, because the group is what was
+   judged. A collection award is one line naming the exhibitor with its
+   pieces underneath; a representative award names the piece that was judged
+   and says what it stood for. */
+function MedalSummary({ config, entries, groupRecords }) {
+  const { rows } = buildAwards(entries, groupRecords, config);
+  const buckets = MEDALS.filter((m) => m.key !== 'none').map((m) => ({
+    m,
+    list: rows
+      .filter((r) => r.result.finalMedal?.key === m.key)
+      .sort((a, b) => b.result.total - a.result.total),
+  }));
+  const pending = rows.filter((r) => !r.result.finalMedal).length;
 
   return (
-    <div className="space-y-5 mb-6">
-      {sections.map((s) => (
-        <div key={s.id}>
-          <div className="flex items-baseline gap-2 border-b border-slate-200 pb-1 mb-2">
-            <h4 className="sb-display text-sm text-slate-900">{s.name}</h4>
-            <span className="sb-mono text-[10px] text-slate-400">
-              {s.inCat.length} {s.inCat.length === 1 ? 'entry' : 'entries'}
-            </span>
-          </div>
-          {s.tiers.length === 0 ? (
-            <p className="text-xs text-slate-400">No tier awards yet.</p>
+    <div className="space-y-4 mb-6">
+      {buckets.map((b) => (
+        <div key={b.m.key}>
+          <p className="text-xs font-semibold uppercase tracking-wide mb-1.5" style={{ color: MEDAL_COLOR[b.m.key] }}>
+            {b.m.name} · {b.list.length}
+          </p>
+          {b.list.length === 0 ? (
+            <p className="text-xs text-slate-400">—</p>
           ) : (
-            <div className="space-y-2.5">
-              {s.tiers.map(({ t, items }) => (
-                <div key={t.key}>
-                  <p className="text-xs font-semibold uppercase tracking-wide mb-1" style={{ color: TIER_BAR_COLOR[t.key] }}>
-                    {t.name} · {items.length}
-                  </p>
-                  <ul className="space-y-0.5">
-                    {items.map(({ e, r }) => (
-                      <li key={e.id} className="text-sm text-slate-700 flex items-center gap-2">
-                        <EntryBadgeInline number={e.number} />
-                        <span className="truncate">{e.modelName}</span>
-                        <span className="sb-mono text-xs text-slate-400 ml-auto">{r.score}</span>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              ))}
-            </div>
-          )}
-          {s.unplaced.length > 0 && (
-            <p className="text-xs text-slate-400 mt-1.5">
-              {s.unplaced.length} {s.unplaced.length === 1 ? 'entry' : 'entries'} with no award or not yet judged.
-            </p>
+            <ul className="space-y-1">
+              {b.list.map((row) => {
+                const note = awardScopeNote(row);
+                const isCollection = row.result.scope === 'collection';
+                const shown = isCollection ? row.group.entries : [row.rep || row.group.entries[0]];
+                return (
+                  <li key={row.group.key} className="text-sm text-slate-700">
+                    <div className="flex items-center gap-2">
+                      <span className="truncate font-medium">
+                        {isCollection ? `${row.group.name} — ${categoryName(config, row.group.categoryId)}` : shown[0]?.modelName}
+                      </span>
+                      <span className="sb-mono text-xs text-slate-400 ml-auto shrink-0">
+                        {row.result.total}/{row.result.max}
+                      </span>
+                    </div>
+                    {note && <p className="text-[11px] text-teal-700 font-medium">{note}</p>}
+                    <ul className="mt-0.5">
+                      {shown.filter(Boolean).map((e) => (
+                        <li key={e.id} className="text-xs text-slate-500 flex items-center gap-1">
+                          <EntryBadgeInline number={e.number} />
+                          <span className="truncate">{e.modelName}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </li>
+                );
+              })}
+            </ul>
           )}
         </div>
       ))}
+      {pending > 0 && <p className="text-xs text-slate-400">{pending} groups still awaiting a selection decision or marks.</p>}
     </div>
   );
 }
@@ -1318,11 +1755,11 @@ function AwardRow({ award, config, entries, onAssign }) {
   );
 }
 
-function AwardsTab({ config, entries, onAssign }) {
+function AwardsTab({ config, entries, groupRecords, onAssign }) {
   return (
     <div>
-      <h3 className="font-semibold text-slate-800 text-sm mb-2">Tier results</h3>
-      <TierSummary config={config} entries={entries} />
+      <h3 className="font-semibold text-slate-800 text-sm mb-2">Medal results</h3>
+      <MedalSummary config={config} entries={entries} groupRecords={groupRecords} />
       <div className="border-t border-slate-200 pt-4">
         <h3 className="font-semibold text-slate-800 text-sm mb-1">Special awards</h3>
         <p className="text-xs text-slate-500 mb-3">Assigned by the panel — not computed from scores.</p>
@@ -1334,6 +1771,122 @@ function AwardsTab({ config, entries, onAssign }) {
               <AwardRow key={a.id} award={a} config={config} entries={entries} onAssign={onAssign} />
             ))}
           </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* The Awards Committee Chairman's view. He supervises the judging without
+   scoring in it — the whole point of the role is that he sits outside the
+   teams and can therefore see the exhibition and the judging process as a
+   whole. Where a team disagrees or ties, his ruling here is final and is
+   recorded against the group. */
+function ChairmanRow({ row, config, onRule }) {
+  const [open, setOpen] = useState(false);
+  const [note, setNote] = useState(row.result.ruled ? '' : '');
+  const g = row.group;
+  const team = teamForCategory(config, g.categoryId);
+  const flagged = row.result.flags.some((f) => ['unselected', 'spread'].includes(f.key));
+
+  return (
+    <div className={`border rounded-lg p-3 ${flagged ? 'border-amber-300 bg-amber-50/40' : 'border-slate-200 bg-white'}`}>
+      <button onClick={() => setOpen((o) => !o)} className="w-full flex items-center gap-3 text-left">
+        <EntryBadge number={g.entries[0].number} size="sm" />
+        <div className="flex-1 min-w-0">
+          <p className="font-medium text-slate-900 truncate text-sm">
+            {g.name} — {categoryName(config, g.categoryId)}
+          </p>
+          <p className="text-xs text-slate-500 truncate">
+            {g.entries.length} piece{g.entries.length === 1 ? '' : 's'}
+            {awardScopeNote(row) ? ` · ${awardScopeNote(row)}` : ''}
+            {team ? ` · ${team.name}` : ''}
+          </p>
+        </div>
+        <div className="text-right shrink-0">
+          <MedalChip medal={row.result.finalMedal} size="sm" />
+          <p className="sb-mono text-[10px] text-slate-400 mt-0.5">
+            {row.result.total}/{row.result.max} · {row.result.n}/{row.result.expected} in
+          </p>
+        </div>
+        {open ? <ChevronUp size={16} className="text-slate-400 shrink-0" /> : <ChevronDown size={16} className="text-slate-400 shrink-0" />}
+      </button>
+
+      {open && (
+        <div className="mt-3 pt-3 border-t border-slate-100">
+          <div className="flex flex-wrap gap-3 mb-2">
+            {row.result.marks.map((m) => (
+              <span key={m.slot} className="sb-mono text-xs text-slate-600">Judge {m.slot}: {m.value}</span>
+            ))}
+            {row.result.marks.length === 0 && <span className="text-xs text-slate-400">No marks yet.</span>}
+          </div>
+          <ul className="mb-2">
+            {g.entries.map((e) => (
+              <li key={e.id} className="text-xs text-slate-500 flex items-center gap-1">
+                <EntryBadgeInline number={e.number} />
+                <span className="truncate">{e.modelName}</span>
+                {row.medalled.some((x) => x.id === e.id) && (
+                  <span className="text-teal-700 font-semibold uppercase text-[10px] ml-1">· Medalled</span>
+                )}
+              </li>
+            ))}
+          </ul>
+          {row.result.flags.map((f) => <FlagNote key={f.key} flag={f} />)}
+
+          <p className="text-xs font-semibold text-slate-500 mt-3 mb-1">Chairman's ruling — final say</p>
+          <input
+            className="sb-input mb-2"
+            placeholder="Reason (optional, recorded with the ruling)"
+            value={note}
+            onChange={(e) => setNote(e.target.value)}
+          />
+          <div className="flex flex-wrap gap-1.5">
+            {MEDALS.map((m) => (
+              <button
+                key={m.key}
+                onClick={() => onRule(g.key, m.key, note)}
+                className="text-xs font-semibold rounded px-2.5 py-1.5 bg-white border border-slate-300 hover:border-slate-500 text-slate-700"
+              >
+                Set {m.name}
+              </button>
+            ))}
+            {row.result.ruled && (
+              <button onClick={() => onRule(g.key, null, '')} className="text-xs text-slate-500 underline px-1">
+                Clear ruling
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function JudgingTab({ config, entries, groupRecords, onRule }) {
+  const [onlyFlagged, setOnlyFlagged] = useState(false);
+  const { rows } = buildAwards(entries, groupRecords, config);
+  const flaggedCount = rows.filter((r) => r.result.flags.some((f) => ['unselected', 'spread'].includes(f.key))).length;
+  const shown = onlyFlagged
+    ? rows.filter((r) => r.result.flags.some((f) => ['unselected', 'spread'].includes(f.key)))
+    : rows;
+
+  return (
+    <div>
+      <h3 className="font-semibold text-slate-800 text-sm mb-1">
+        Judging oversight{config.chairmanName ? ` — ${config.chairmanName}` : ''}
+      </h3>
+      <p className="text-xs text-slate-500 mb-3">
+        Every group, its marks, and its point total. Where a team disagrees or ties, the Awards Committee
+        Chairman has the final say — a ruling here overrides the point total and is recorded against the group.
+      </p>
+      <label className="text-xs text-slate-600 flex items-center gap-1.5 mb-3">
+        <input type="checkbox" checked={onlyFlagged} onChange={(e) => setOnlyFlagged(e.target.checked)} />
+        Only groups needing review ({flaggedCount})
+      </label>
+      <div className="space-y-2">
+        {shown.length === 0 && <p className="text-slate-400 text-sm text-center py-10">Nothing to review.</p>}
+        {shown.map((row) => (
+          <ChairmanRow key={row.group.key} row={row} config={config} onRule={onRule} />
         ))}
       </div>
     </div>
@@ -1369,13 +1922,14 @@ function PrintTab({ onPrintAllTags, onPrintResults, onPrintRules, onPrintSign })
   );
 }
 
-function OrganizerView({ config, entries, onUpdateConfig, onUpdateEntry, onDeleteEntry, onPublishToggle, onAssignAward, onPrintAllTags, onPrintResults, onPrintRules, onPrintSign, onSyncCategories, categorySyncing }) {
+function OrganizerView({ config, entries, groupRecords, onUpdateConfig, onUpdateEntry, onDeleteEntry, onPublishToggle, onAssignAward, onRule, onPrintAllTags, onPrintResults, onPrintRules, onPrintSign, onSyncCategories, categorySyncing }) {
   const [tab, setTab] = useState('overview');
   const [editingSettings, setEditingSettings] = useState(false);
 
   const tabs = [
     { id: 'overview', label: 'Overview', icon: BarChart3 },
     { id: 'entries', label: 'Entries', icon: Users },
+    { id: 'judging', label: 'Judging', icon: ListChecks },
     { id: 'awards', label: 'Awards', icon: Trophy },
     { id: 'print', label: 'Print', icon: Printer },
     { id: 'settings', label: 'Settings', icon: Settings },
@@ -1396,9 +1950,10 @@ function OrganizerView({ config, entries, onUpdateConfig, onUpdateEntry, onDelet
         ))}
       </div>
 
-      {tab === 'overview' && <OverviewTab config={config} entries={entries} onPublishToggle={onPublishToggle} />}
-      {tab === 'entries' && <EntriesTab config={config} entries={entries} onUpdateEntry={onUpdateEntry} onDeleteEntry={onDeleteEntry} />}
-      {tab === 'awards' && <AwardsTab config={config} entries={entries} onAssign={onAssignAward} />}
+      {tab === 'overview' && <OverviewTab config={config} entries={entries} groupRecords={groupRecords} onPublishToggle={onPublishToggle} />}
+      {tab === 'entries' && <EntriesTab config={config} entries={entries} groupRecords={groupRecords} onUpdateEntry={onUpdateEntry} onDeleteEntry={onDeleteEntry} />}
+      {tab === 'judging' && <JudgingTab config={config} entries={entries} groupRecords={groupRecords} onRule={onRule} />}
+      {tab === 'awards' && <AwardsTab config={config} entries={entries} groupRecords={groupRecords} onAssign={onAssignAward} />}
       {tab === 'print' && <PrintTab onPrintAllTags={onPrintAllTags} onPrintResults={onPrintResults} onPrintRules={onPrintRules} onPrintSign={onPrintSign} />}
       {tab === 'settings' && (
         editingSettings ? (
@@ -1411,7 +1966,14 @@ function OrganizerView({ config, entries, onUpdateConfig, onUpdateEntry, onDelet
         ) : (
           <div className="bg-white border border-slate-200 rounded-lg p-4 space-y-4">
             <div>
-              <p className="text-sm text-slate-600 mb-3">Edit show name, date, location, staff PIN, judging panel, and categories.</p>
+              <p className="text-sm text-slate-600 mb-1">
+                Edit show name, date, location, staff PIN, the Awards Committee Chairman, the judging teams, and
+                categories.
+              </p>
+              <p className="text-xs text-slate-500 mb-3">
+                {(config.teams || []).map((t) => `${t.name} (${t.judgeCount} judges)`).join(' · ')}
+                {config.chairmanName ? ` · Chairman: ${config.chairmanName}` : ''}
+              </p>
               <button onClick={() => setEditingSettings(true)} className="text-sm font-medium text-teal-700 flex items-center gap-1">
                 <Edit2 size={14} /> Edit show settings
               </button>
@@ -1438,11 +2000,11 @@ function OrganizerView({ config, entries, onUpdateConfig, onUpdateEntry, onDelet
 
 /* ---------------------------------- results ---------------------------------- */
 
-function ResultsView({ config, entries }) {
-  const results = entries.map((e) => ({ e, r: computeScore(e.scores, config.judgeCount, e.headConfirm) }));
-  const tierGroups = TIERS.filter((t) => t.key !== 'none').map((t) => ({
-    t,
-    items: results.filter((x) => x.r.finalTier?.key === t.key).sort((a, b) => b.r.score - a.r.score),
+function ResultsView({ config, entries, groupRecords }) {
+  const { rows } = buildAwards(entries, groupRecords, config);
+  const medalGroups = MEDALS.filter((m) => m.key !== 'none').map((m) => ({
+    m,
+    items: rows.filter((r) => r.result.finalMedal?.key === m.key).sort((a, b) => b.result.total - a.result.total),
   }));
 
   const namedResults = SPECIAL_AWARDS.map((a) => {
@@ -1472,23 +2034,50 @@ function ResultsView({ config, entries }) {
       ))}
 
       <div className="space-y-6 mb-10">
-        {tierGroups.map(({ t, items }) => items.length > 0 && (
-          <div key={t.key}>
-            <h3 className="sb-display text-lg mb-2 pb-2 border-b border-slate-200" style={{ color: TIER_BAR_COLOR[t.key] }}>
-              {t.name}
+        {medalGroups.map(({ m, items }) => items.length > 0 && (
+          <div key={m.key}>
+            <h3 className="sb-display text-lg mb-2 pb-2 border-b border-slate-200" style={{ color: MEDAL_COLOR[m.key] }}>
+              {m.name}
             </h3>
-            <div className="space-y-1.5">
-              {items.map(({ e }) => (
-                <div key={e.id} className="flex items-center gap-3">
-                  <EntryBadgeInline number={e.number} />
-                  <span className="font-medium text-slate-900">{e.modelName}</span>
-                  <span className="text-slate-400 text-sm">{e.name}</span>
-                </div>
-              ))}
+            <div className="space-y-3">
+              {items.map((row) => {
+                const isCollection = row.result.scope === 'collection';
+                const note = awardScopeNote(row);
+                const shown = isCollection ? row.group.entries : [row.rep || row.group.entries[0]];
+                return (
+                  <div key={row.group.key}>
+                    {isCollection ? (
+                      <>
+                        <p className="font-medium text-slate-900">
+                          {row.group.name} — {categoryName(config, row.group.categoryId)}
+                        </p>
+                        <p className="text-xs text-teal-700 font-medium mb-1">{note}</p>
+                        <div className="space-y-1 ml-1">
+                          {shown.map((e) => (
+                            <div key={e.id} className="flex items-center gap-2 text-sm">
+                              <EntryBadgeInline number={e.number} />
+                              <span className="text-slate-700">{e.modelName}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </>
+                    ) : (
+                      <>
+                        <div className="flex items-center gap-3">
+                          <EntryBadgeInline number={shown[0]?.number} />
+                          <span className="font-medium text-slate-900">{shown[0]?.modelName}</span>
+                          <span className="text-slate-400 text-sm">{row.group.name}</span>
+                        </div>
+                        {note && <p className="text-xs text-teal-700 font-medium ml-1">{note}</p>}
+                      </>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           </div>
         ))}
-        {results.every((x) => x.r.finalTier === null) && (
+        {rows.every((r) => !r.result.finalMedal) && (
           <p className="text-slate-400 text-center py-10">Awards will appear here once published.</p>
         )}
       </div>
@@ -1539,13 +2128,16 @@ function TagCard({ entry, config }) {
   );
 }
 
-function ResultsSheet({ config, entries }) {
-  const sections = groupByCategoryThenTier(config, entries);
-
+function ResultsSheet({ config, entries, groupRecords }) {
+  const { rows } = buildAwards(entries, groupRecords, config);
+  const teamLine = (config.teams || []).map((t) => `${t.name} (${t.judgeCount} judges)`).join(' · ');
   return (
     <div className="printdoc">
       <h1>{config.name}</h1>
-      <p>{config.date} · {config.judgeCount}-judge panel</p>
+      <p>
+        {config.date} · Open judging system · {teamLine}
+        {config.chairmanName ? ` · Awards Committee Chairman: ${config.chairmanName}` : ''}
+      </p>
       <h2>Special awards</h2>
       <table>
         <thead><tr><th style={{ width: '40%' }}>Award</th><th>Recipient</th></tr></thead>
@@ -1566,45 +2158,42 @@ function ResultsSheet({ config, entries }) {
           })}
         </tbody>
       </table>
-      {sections.map((s) => (
-        <div className="catblock" key={s.id}>
-          <h2>{s.name} <span className="catcount">{s.inCat.length} {s.inCat.length === 1 ? 'entry' : 'entries'}</span></h2>
-          {s.tiers.length === 0 ? (
-            <p>No tier awards in this category.</p>
-          ) : (
-            <table>
-              <thead>
-                <tr>
-                  <th style={{ width: '10%' }}>No.</th>
-                  <th style={{ width: '40%' }}>Model</th>
-                  <th>Entrant</th>
-                  <th style={{ width: '12%' }}>Score</th>
-                </tr>
-              </thead>
-              <tbody>
-                {s.tiers.map(({ t, items }) => (
-                  <React.Fragment key={t.key}>
-                    <tr><td className="tiername" colSpan={4}>{t.name} · {items.length}</td></tr>
-                    {items.map(({ e, r }) => (
-                      <tr key={e.id}>
-                        <td>{pad(e.number)}</td>
-                        <td>{e.modelName}</td>
-                        <td>{e.name}</td>
-                        <td>{r.score}</td>
-                      </tr>
-                    ))}
-                  </React.Fragment>
-                ))}
-              </tbody>
-            </table>
-          )}
-          {s.unplaced.length > 0 && (
-            <p style={{ fontSize: '8.5pt', color: '#444' }}>
-              {s.unplaced.length} {s.unplaced.length === 1 ? 'entry' : 'entries'} with no award or not yet judged.
-            </p>
-          )}
-        </div>
-      ))}
+      <h2>Medals</h2>
+      <p style={{ fontSize: '8.5pt' }}>
+        Judged by group — one exhibitor's pieces within one category. Where a group holds more than one piece, the
+        team either judged the single best piece as representative of the group (only that piece is medalled) or
+        judged the whole collection as one (every piece takes the medal). The Award column says which.
+      </p>
+      <table>
+        <thead>
+          <tr>
+            <th>Exhibitor</th><th>Category</th><th>Award</th><th>Pieces medalled</th><th>Points</th><th>Medal</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row) => {
+            const note = awardScopeNote(row) || 'Single piece';
+            const list = row.medalled.length ? row.medalled : [];
+            return (
+              <tr key={row.group.key}>
+                <td>{row.group.name}</td>
+                <td>{categoryName(config, row.group.categoryId)}</td>
+                <td>{note}</td>
+                <td>
+                  {list.length === 0
+                    ? '—'
+                    : list.map((e) => <div key={e.id}>#{pad(e.number)} {e.modelName}</div>)}
+                </td>
+                <td>{row.result.finalMedal ? `${row.result.total} / ${row.result.max}` : '—'}</td>
+                <td>
+                  {row.result.finalMedal ? row.result.finalMedal.name : '—'}
+                  {row.result.ruled ? ' (Chairman)' : ''}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
     </div>
   );
 }
@@ -1631,60 +2220,122 @@ function RegistrationSign({ config }) {
 }
 
 function RulesSheet({ config }) {
+  const teams = config.teams || [];
+  const sizes = Array.from(new Set(teams.map((t) => Number(t.judgeCount) || 3))).sort((a, b) => b - a);
   return (
     <div className="printdoc">
-      <h1>Judging rules — {config.name}</h1>
-      <h2>The rubric</h2>
+      <h1>Judging rules &mdash; {config.name}</h1>
       <p>
-        Every judge scores every entry independently on the same three criteria, each with its own share of 100
-        points: Technical ability (0–{CRITERIA.find((c) => c.key === 'technical').max}), Composition
-        (0–{CRITERIA.find((c) => c.key === 'composition').max}), and Difficulty
-        (0–{CRITERIA.find((c) => c.key === 'difficulty').max}). A judge's score for an entry is the sum of their
-        three marks, which lands between 0 and 100 on its own since those three maxes add up to 100. Judges do not
-        compare notes before scoring, and do not see each other's marks until their own are in.
+        This show uses the Open judging system, as used at most U.S. figure exhibitions. Awards are earned against
+        a standard, not won in competition against the other entries: any number of pieces can take the same
+        medal, and every piece is judged on its own merits.
       </p>
-      <h2>From marks to a tier</h2>
+
+      <h2>Teams</h2>
       <p>
-        A judge score is the average of that judge's three marks. The panel score is the average of the judge
-        scores, rounded to a whole number. That number is the entry's score out of 100 and it earns the tier.
+        Judging is done by two or more teams, each normally of three judges. A judge never judges his own work; if
+        a piece in front of a team is that judge&rsquo;s own, another judge on the team scores it.
+        {teams.length > 0 && ` This show is running ${teams.length} team${teams.length === 1 ? '' : 's'}: ${teams.map((t) => `${t.name}, ${t.judgeCount} judges`).join('; ')}.`}
+      </p>
+
+      <h2>Selecting what is judged</h2>
+      <p>
+        The team first agrees, by concurrence, on what it is judging. It selects the piece or pieces most likely to
+        give the exhibitor the highest award. At least one piece or group of pieces is selected for every
+        exhibitor, even where the team feels the work is unlikely to win an award. Where an exhibitor has several
+        pieces in one category, the team decides together between two outcomes: judge the single best piece as
+        representative of the group, in which case only that piece is medalled; or judge the whole collection as
+        one, in which case every piece in it takes the same medal. Each judge records the title of the piece and
+        the exhibitor&rsquo;s name on his form as the selections are made.
+      </p>
+
+      <h2>Awarding points</h2>
+      <p>
+        The judges then award points independently of each other &mdash; no conferring, and no judge sees another
+        judge&rsquo;s marks until his own are in. Each judge awards each selected piece or group up to four points:
+        1&ndash;2 points for a Bronze Medal, 3 points for a Silver Medal, and 4 points for a Gold Medal. A piece a
+        judge considers unworthy of an award scores 0.
+      </p>
+      <p>
+        Note that this is one mark for the whole piece or group, not a mark per criterion. The criteria below are
+        what a judge weighs in arriving at that single number.
       </p>
       <table>
-        <thead><tr><th>Tier</th><th>Panel score</th></tr></thead>
+        <thead><tr><th>Mark</th><th>Meaning</th></tr></thead>
         <tbody>
-          <tr><td>Gold</td><td>86 – 100</td></tr>
-          <tr><td>Silver</td><td>76 – 85</td></tr>
-          <tr><td>Bronze</td><td>65 – 75</td></tr>
-          <tr><td>Merit</td><td>50 – 64</td></tr>
-          <tr><td>No award</td><td>below 50</td></tr>
+          {MARK_GUIDE.map((m) => (
+            <tr key={m.value}><td>{m.value}</td><td>{m.label}</td></tr>
+          ))}
         </tbody>
       </table>
-      <h2>Three judges</h2>
+
+      <h2>Judging criteria</h2>
+      <p>Not listed in order of importance or of consideration.</p>
+      <table>
+        <thead><tr><th style={{ width: '32%' }}>Criterion</th><th>What it covers</th></tr></thead>
+        <tbody>
+          {CRITERIA.map((c) => (
+            <tr key={c.key}><td>{c.name}</td><td>{c.hint}</td></tr>
+          ))}
+        </tbody>
+      </table>
+
+      <h2>From points to a medal</h2>
       <p>
-        Three scores give the panel a natural majority. One check applies: if any judge score sits more than{' '}
-        {LIMITS.outlier} points from the average of the other two, the entry is flagged for the panel to look at
-        again together. The flag is advisory — the tier stands unless a judge changes a mark.
+        The sheets go to the Awards Committee, which checks them for accuracy and integrity and tallies the points
+        each judge gave. The total earns the medal. With a full team of three judges the maximum any piece or
+        group can receive is 12 points. Where a team is reduced to two judges the maximum is 8, and the bands are
+        scaled to match, so a Gold still means every judge on the team independently saw gold-standard work.
       </p>
-      <h2>Two judges</h2>
+      {sizes.includes(3) && (
+        <>
+          <p><strong>Three judges &mdash; maximum 12 points</strong></p>
+          <table>
+            <thead><tr><th>Medal</th><th>Point total</th></tr></thead>
+            <tbody>
+              <tr><td>Gold Medal</td><td>11 &ndash; 12</td></tr>
+              <tr><td>Silver Medal</td><td>8 &ndash; 10</td></tr>
+              <tr><td>Bronze Medal</td><td>1 &ndash; 7</td></tr>
+              <tr><td>No award</td><td>0</td></tr>
+            </tbody>
+          </table>
+        </>
+      )}
+      {sizes.includes(2) && (
+        <>
+          <p><strong>Two judges &mdash; maximum 8 points</strong></p>
+          <table>
+            <thead><tr><th>Medal</th><th>Point total</th></tr></thead>
+            <tbody>
+              <tr><td>Gold Medal</td><td>8</td></tr>
+              <tr><td>Silver Medal</td><td>6 &ndash; 7</td></tr>
+              <tr><td>Bronze Medal</td><td>1 &ndash; 5</td></tr>
+              <tr><td>No award</td><td>0</td></tr>
+            </tbody>
+          </table>
+        </>
+      )}
+
+      <h2>The Awards Committee Chairman</h2>
       <p>
-        With two judges there is no majority, so disagreement is resolved rather than averaged away. If the two
-        judge scores are within {LIMITS.divergence} points of each other, the result stands. If they are further
-        apart, compare the sheet line by line, discuss only the criteria that differ by {LIMITS.criterionGap} or
-        more, and re-mark those. Still apart afterward? The head judge scores the entry as a third judge and the
-        result is computed across all three. If the panel score lands within {LIMITS.boundary} points below a tier
-        line, the head judge inspects the model and either moves it up or holds it — the decision is recorded
-        against the entry. A single judge score is advisory only; no tier is awarded on it.
+        The Awards Committee Chairman supervises the judging{config.chairmanName ? ` (${config.chairmanName})` : ''}.
+        Experience with the system and detachment from the actual judging give him an overall view of the work on
+        exhibition and of the judging process; he does not score as a judge. In the case of disagreement, or even a
+        tie within a judging team, the Chairman has the final say. Any ruling he makes is recorded against the
+        group it applies to.
       </p>
+
       <h2>Special awards</h2>
       <p>
-        Tier awards are earned against the rubric — any number of entries can hold the same tier. The named and
+        Medals are earned against the standard, so any number of entries can hold the same medal. The named and
         category awards are comparative: the panel picks one recipient each (or several, for the Capital Palette
-        awards) by discussion. An entry can hold a tier award and any number of special awards at once.
+        awards) by discussion. An entry can hold a medal and any number of special awards at once.
       </p>
     </div>
   );
 }
 
-function PrintLayer({ job, config, entries }) {
+function PrintLayer({ job, config, entries, groupRecords }) {
   if (!job) return <div className="print-only" />;
 
   if (job.type === 'tags') {
@@ -1701,7 +2352,7 @@ function PrintLayer({ job, config, entries }) {
       </div>
     );
   }
-  if (job.type === 'results') return <div className="print-only"><ResultsSheet config={config} entries={entries} /></div>;
+  if (job.type === 'results') return <div className="print-only"><ResultsSheet config={config} entries={entries} groupRecords={groupRecords} /></div>;
   if (job.type === 'rules') return <div className="print-only"><RulesSheet config={config} /></div>;
   if (job.type === 'sign') return <div className="print-only"><RegistrationSign config={config} /></div>;
   return <div className="print-only" />;
@@ -1727,6 +2378,7 @@ function viewTitle(v) {
 export default function App() {
   const [config, setConfig] = useState(null);
   const [entries, setEntries] = useState([]);
+  const [groupRecords, setGroupRecords] = useState({});
   const [loading, setLoading] = useState(true);
   const [view, setView] = useState(getViewFromUrl);
   const [unlocked, setUnlocked] = useState({ desk: false, judge: false, organizer: false });
@@ -1738,10 +2390,12 @@ export default function App() {
   const refresh = useCallback(async () => {
     const cfgRaw = await safeGet('brushscore:config', true);
     const entRaw = await safeGet('brushscore:entries', true);
+    const grpRaw = await safeGet('brushscore:groups', true);
     const rawConfig = cfgRaw ? JSON.parse(cfgRaw) : null;
     const normalized = normalizeConfig(rawConfig);
     setConfig(normalized);
     setEntries((entRaw ? JSON.parse(entRaw) : []).map(normalizeEntry));
+    setGroupRecords(grpRaw ? JSON.parse(grpRaw) : {});
     setLoading(false);
     // If the default category list picked up names the saved show doesn't
     // have yet, normalizeConfig just added them with fresh ids. Persist
@@ -1778,6 +2432,49 @@ export default function App() {
     catch (e) { notify('Could not save — try again.', 'error'); }
   };
 
+  /* Group decisions are written by several judges on several devices at once,
+     so each write re-reads the store and patches only its own group before
+     saving. Two judges marking different groups seconds apart would otherwise
+     each save a whole snapshot and the later one would erase the earlier. */
+  const patchGroup = async (key, patch) => {
+    const raw = await safeGet('brushscore:groups', true);
+    const latest = raw ? JSON.parse(raw) : groupRecords;
+    const current = latest[key] || emptyGroup(key);
+    const next = { ...latest, [key]: { ...current, ...patch } };
+    setGroupRecords(next);
+    try { await window.storage.set('brushscore:groups', JSON.stringify(next), true); }
+    catch (e) { notify('Could not save — try again.', 'error'); }
+    return next;
+  };
+
+  const setGroupScope = async (key, scope, repEntryId) => {
+    // Changing the scope invalidates marks given under the old one: a mark
+    // for "the best of these four" is not a mark for the collection. Clearing
+    // them is the honest option — better a visible re-score than a total
+    // silently built from marks the judges gave to a different question.
+    await patchGroup(key, { scope, repEntryId, marks: {}, ruling: null, rulingNote: '' });
+    notify(
+      scope === 'collection' ? 'Judging the whole collection.'
+        : scope === 'representative' ? 'Representative piece selected.'
+          : 'Selection cleared — marks reset.'
+    );
+  };
+
+  const setGroupMark = async (key, seat, value, teamId) => {
+    const raw = await safeGet('brushscore:groups', true);
+    const latest = raw ? JSON.parse(raw) : groupRecords;
+    const current = latest[key] || emptyGroup(key);
+    const marks = { ...current.marks };
+    if (value === null || value === undefined) delete marks[seat];
+    else marks[seat] = value;
+    await patchGroup(key, { marks, teamId: current.teamId || teamId || null });
+  };
+
+  const setChairmanRuling = async (key, medalKey, note) => {
+    await patchGroup(key, { ruling: medalKey, rulingNote: medalKey ? (note || '') : '' });
+    notify(medalKey ? `Chairman's ruling recorded: ${medalByKey(medalKey)?.name}.` : 'Ruling cleared.');
+  };
+
   const addEntry = async (form, isWalkIn = false) => {
     const cfgRaw = await safeGet('brushscore:config', true);
     const entRaw = await safeGet('brushscore:entries', true);
@@ -1810,17 +2507,6 @@ export default function App() {
     notify(val ? 'Checked in.' : 'Check-in removed.');
   };
 
-  const setScore = async (entryId, slot, marks) => {
-    const newEntries = entries.map((e) => (e.id === entryId ? { ...e, scores: { ...e.scores, [slot]: marks } } : e));
-    await saveEntriesNow(newEntries);
-  };
-
-  const setHeadConfirm = async (entryId, value) => {
-    const newEntries = entries.map((e) => (e.id === entryId ? { ...e, headConfirm: value } : e));
-    await saveEntriesNow(newEntries);
-    notify(value === 'up' ? 'Moved up a tier.' : value === 'hold' ? 'Held at the current tier.' : 'Decision cleared.');
-  };
-
   const assignAward = async (awardId, value) => {
     const newConfig = { ...config, specialAwards: { ...config.specialAwards, [awardId]: value } };
     await saveConfigNow(newConfig);
@@ -1829,6 +2515,16 @@ export default function App() {
   const deleteEntry = async (id) => {
     const newEntries = entries.filter((e) => e.id !== id);
     await saveEntriesNow(newEntries);
+    // Drop any group the deletion emptied out. Without this, an exhibitor
+    // removed and later re-registered under the same name and category would
+    // silently inherit the old team's marks and ruling.
+    const live = new Set(buildGroups(newEntries).map((g) => g.key));
+    const pruned = Object.fromEntries(Object.entries(groupRecords).filter(([k]) => live.has(k)));
+    if (Object.keys(pruned).length !== Object.keys(groupRecords).length) {
+      setGroupRecords(pruned);
+      try { await window.storage.set('brushscore:groups', JSON.stringify(pruned), true); }
+      catch (e) { /* best effort — the stale record is inert until that name and category recur */ }
+    }
     notify('Entry removed.');
   };
 
@@ -1906,7 +2602,7 @@ export default function App() {
       <GlobalStyles />
       <div className="min-h-screen bg-slate-50 sb-root no-print">
         {view !== 'landing' && <TopBar title={viewTitle(view)} onBack={() => nav('landing')} />}
-        {view === 'landing' && <Landing config={config} entries={entries} onNav={nav} />}
+        {view === 'landing' && <Landing config={config} entries={entries} onNav={nav} onPrintTag={(entry) => printTags([entry])} />}
         {view === 'register' && <RegisterView config={config} onSubmit={(form) => addEntry(form, false)} onPrintTag={(entry) => printTags([entry])} />}
         {view === 'desk' && (
           <PinGate config={config} unlocked={unlocked.desk} onUnlock={() => setUnlocked((u) => ({ ...u, desk: true }))} label="Registration Desk">
@@ -1915,7 +2611,14 @@ export default function App() {
         )}
         {view === 'judge' && (
           <PinGate config={config} unlocked={unlocked.judge} onUnlock={() => setUnlocked((u) => ({ ...u, judge: true }))} label="Judging">
-            <JudgeView config={config} entries={entries} onScore={setScore} onHeadConfirm={setHeadConfirm} notify={notify} />
+            <JudgeView
+              config={config}
+              entries={entries}
+              groupRecords={groupRecords}
+              onSetScope={setGroupScope}
+              onSetMark={setGroupMark}
+              notify={notify}
+            />
           </PinGate>
         )}
         {view === 'organizer' && (
@@ -1923,11 +2626,13 @@ export default function App() {
             <OrganizerView
               config={config}
               entries={entries}
+              groupRecords={groupRecords}
               onUpdateConfig={(cfg) => saveConfigNow(normalizeConfig(cfg))}
               onUpdateEntry={updateEntry}
               onDeleteEntry={deleteEntry}
               onPublishToggle={publishToggle}
               onAssignAward={assignAward}
+              onRule={setChairmanRuling}
               onPrintAllTags={() => printTags(entries)}
               onPrintResults={printResultsSheet}
               onPrintRules={printRulesSheet}
@@ -1937,10 +2642,10 @@ export default function App() {
             />
           </PinGate>
         )}
-        {view === 'results' && <ResultsView config={config} entries={entries} />}
+        {view === 'results' && <ResultsView config={config} entries={entries} groupRecords={groupRecords} />}
         <Toast message={toast?.msg} type={toast?.type} />
       </div>
-      <PrintLayer job={printJob} config={config} entries={entries} />
+      <PrintLayer job={printJob} config={config} entries={entries} groupRecords={groupRecords} />
     </>
   );
 }

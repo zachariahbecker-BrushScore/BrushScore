@@ -1,188 +1,202 @@
-// The judging engine: three criteria at 0-100, averaged twice.
-//
-//   judge score = average of that judge's three marks         -> 0-100
-//   panel score = average of the judge scores, rounded        -> 0-100
-//
-// The formula is identical for a two-judge and a three-judge panel; only
-// the count of numbers in the second average changes, so the tier bands
-// never move with panel size.
+/* ---------------------------------------------------------------------------
+   scoring.js — the "Open" judging system
 
-// Each criterion carries its own share of the 100 points available, rather
-// than all three being marked 0-100 and averaged. A judge's mark for a
-// criterion cannot exceed that criterion's max, and a judge's score for an
-// entry is the SUM of their three marks — which lands between 0 and 100 by
-// construction, because the three max values below add up to exactly 100.
-// If you rebalance these, keep that invariant: the three .max values must
-// still sum to 100, or the tier bands (50/65/76/86) stop meaning what they say.
+   As used by the NCMSS and most U.S. figure exhibitions (Chicago, Atlanta,
+   MFCA). Judging is done by teams of three judges (two is supported as a
+   reduced panel). Each judge awards each selected piece or group of pieces a
+   single whole number from 0 to 4. Those marks are added together and the
+   total earns the medal.
+
+   This is NOT a rubric that adds criterion scores together. The six criteria
+   below are what a judge weighs while arriving at their one mark — they are
+   not scored separately and they carry no point values of their own.
+--------------------------------------------------------------------------- */
+
+export const MAX_PER_JUDGE = 4;
+
+/* Listed in no particular order — the source system is explicit that these
+   are not ranked by importance or order of consideration. */
 export const CRITERIA = [
-  { key: 'technical', name: 'Technical ability', max: 33,
-    hint: 'Brushwork, blending, edge control, surface finish. Seams, mold lines and gaps. Quality of assembly and conversion work.' },
-  { key: 'composition', name: 'Composition', max: 33,
-    hint: "Colour, value and contrast. Pose, focal point and balance. Base, plinth and groundwork, and how the piece reads at arm's length." },
-  { key: 'difficulty', name: 'Difficulty', max: 34,
-    hint: 'Ambition of the subject. Scratch-building, sculpting and conversion. How much the piece asked of the modeller.' },
+  { key: 'difficulty', name: 'Degree of Difficulty', hint: 'How much the piece asked of the modeler — scratch-building, sculpting, conversion, ambition of the subject.' },
+  { key: 'creativity', name: 'Creativity', hint: 'Originality of concept, interpretation, and the ideas behind the piece.' },
+  { key: 'workmanship', name: 'Workmanship', hint: 'Assembly and construction. Seams, mold lines, gaps, fit, and surface preparation.' },
+  { key: 'painting', name: 'Painting Skill', hint: 'Brushwork, blending, edge control, colour, value and contrast, surface finish.' },
+  { key: 'presentation', name: 'Presentation & Overall Effect', hint: 'Pose, focal point, balance, base, plinth and groundwork, and how the piece reads as a whole.' },
+  { key: 'accuracy', name: 'Historical Accuracy', hint: 'Fidelity to the subject, period, uniform, markings and equipment where applicable.' },
 ];
 
-// The sum of the three criteria maxes above — always 100 if the invariant
-// noted above holds. Computed rather than hard-coded so the rules text and
-// any future validation stay honest if the split above ever changes.
-export const CRITERIA_TOTAL = CRITERIA.reduce((sum, c) => sum + c.max, 0);
-
-// Mutable so a show's settings can move a band without a code change.
-export const TIERS = [
-  { key: 'gold', name: 'Gold', min: 86, className: 'gold' },
-  { key: 'silver', name: 'Silver', min: 76, className: 'silver' },
-  { key: 'bronze', name: 'Bronze', min: 65, className: 'bronze' },
-  { key: 'merit', name: 'Merit', min: 50, className: 'merit' },
-  { key: 'none', name: 'No award', min: 0, className: 'none' },
+/* What a single judge's mark means. A judge gives one of these numbers to
+   the whole piece or group — not one per criterion. */
+export const MARK_GUIDE = [
+  { value: 4, short: 'Gold', label: 'Gold-medal standard' },
+  { value: 3, short: 'Silver', label: 'Silver-medal standard' },
+  { value: 2, short: 'Bronze', label: 'Bronze-medal standard' },
+  { value: 1, short: 'Bronze', label: 'Bronze-medal standard' },
+  { value: 0, short: 'None', label: 'No award' },
 ];
 
-export const LIMITS = {
-  divergence: 14,  // points apart two judge scores (each already 0-100) may sit before reconciling
-  outlier: 20,     // points one judge score may sit from the average of the other two
-  boundary: 2,     // points below a tier line that trigger a head-judge look
-  // Per-criterion gap that gets re-marked during reconciliation. Criteria
-  // now max out around 33-34 rather than 100, so this is set to keep the
-  // same ~20% of range that 20-out-of-100 represented originally.
-  criterionGap: 7,
+export const MEDALS = [
+  { key: 'gold', name: 'Gold Medal' },
+  { key: 'silver', name: 'Silver Medal' },
+  { key: 'bronze', name: 'Bronze Medal' },
+  { key: 'none', name: 'No award' },
+];
+
+export function medalByKey(key) {
+  return MEDALS.find((m) => m.key === key) || null;
+}
+
+/* Point bands per panel size. The three-judge bands are the published ones
+   (11–12 Gold, 8–10 Silver, 1–7 Bronze out of 12). The two-judge bands are
+   those same proportions rescaled to a maximum of 8, so Gold still means
+   both judges independently saw gold-standard work. */
+export const MEDAL_BANDS = {
+  3: { max: 12, gold: 11, silver: 8, bronze: 1 },
+  2: { max: 8, gold: 8, silver: 6, bronze: 1 },
 };
 
-export function tierFor(score) {
-  return TIERS.find((t) => score >= t.min) || TIERS[TIERS.length - 1];
+export function bandsFor(judgeCount) {
+  return MEDAL_BANDS[judgeCount] || MEDAL_BANDS[3];
 }
 
-function nextTierUp(tier) {
-  const i = TIERS.findIndex((t) => t.key === tier.key);
-  return i > 0 ? TIERS[i - 1] : tier;
+export function maxPointsFor(judgeCount) {
+  return bandsFor(judgeCount).max;
 }
 
-// A judge's score for an entry is the sum of their per-criterion marks
-// (each already capped at that criterion's own max) — not an average.
-// The three maxes already add up to 100, so the sum lands in 0-100 on its own.
-function judgeTotal(marks) {
-  if (!marks) return null;
-  const vals = CRITERIA.map((c) => marks[c.key]);
-  if (vals.some((v) => v === null || v === undefined || v === '' || Number.isNaN(Number(v)))) return null;
-  return vals.reduce((a, b) => a + Number(b), 0);
+export function medalFor(total, judgeCount) {
+  const b = bandsFor(judgeCount);
+  if (total >= b.gold) return medalByKey('gold');
+  if (total >= b.silver) return medalByKey('silver');
+  if (total >= b.bronze) return medalByKey('bronze');
+  return medalByKey('none');
 }
 
-export function fmt1(n) {
-  return Number.isInteger(n) ? String(n) : n.toFixed(1);
+/* A spread of 2 or more between the highest and lowest mark on a 0–4 scale
+   is a real disagreement about which medal the piece deserves, not a
+   rounding difference. Advisory only — it puts the group in front of the
+   Awards Committee Chairman, who has the final say. */
+export const SPREAD_FLAG_AT = 2;
+
+export const FLAG_LABELS = {
+  unselected: 'Not yet selected',
+  incomplete: 'Awaiting marks',
+  spread: 'Judges disagree',
+  ruled: 'Chairman ruling',
+  conflict: 'Own work',
+};
+
+export function flagLabel(key) {
+  return FLAG_LABELS[key] || key;
+}
+
+/* --------------------------------------------------------------------------
+   Group scoring
+
+   The unit of judging is a group: one exhibitor's entries within one
+   category. A group holds a scope decision made by the team —
+
+     'representative'  one piece is selected and judged as the best of the
+                       group; only that piece takes the medal.
+     'collection'      the whole group is judged together and every piece in
+                       it takes the same medal.
+
+   A group of one piece needs no scope decision; it is simply that piece.
+-------------------------------------------------------------------------- */
+
+export function normalizeName(name) {
+  return String(name || '').trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+export function makeGroupKey(name, categoryId) {
+  return `${normalizeName(name)}::${categoryId}`;
+}
+
+export function emptyGroup(key) {
+  return { key, scope: null, repEntryId: null, teamId: null, marks: {}, ruling: null, rulingNote: '' };
+}
+
+/* Judges do not judge their own work. Matching is on the exhibitor's name as
+   registered against the judge's name as configured in Settings — if a judge
+   seat has no name set, no conflict can be detected and the rule falls back
+   to the panel policing it themselves. */
+export function isOwnWork(judgeName, exhibitorName) {
+  const j = normalizeName(judgeName);
+  return !!j && j === normalizeName(exhibitorName);
 }
 
 /**
- * scoresBySlot: { 1: {technical,composition,difficulty}|undefined, 2: {...}, ... }
- * expectedJudges: how many judges the panel is configured for (2 or 3)
- * headConfirm: null | 'up' | 'hold'
+ * @param {object} group      stored group record (may be undefined)
+ * @param {number} judgeCount size of the team judging it (2 or 3)
+ * @param {string[]} memberIds ids of the entries currently in the group
  */
-export function computeScore(scoresBySlot, expectedJudges, headConfirm) {
-  const slots = Object.keys(scoresBySlot || {})
-    .map(Number)
-    .sort((a, b) => a - b);
-  const judgeScores = slots
-    .map((slot) => ({ slot, score: judgeTotal(scoresBySlot[slot]) }))
-    .filter((j) => j.score !== null);
-  const n = judgeScores.length;
+export function computeGroup(group, judgeCount, memberIds = []) {
+  const g = group || emptyGroup('');
+  const expected = judgeCount || 3;
+  const b = bandsFor(expected);
+  const members = Array.isArray(memberIds) ? memberIds : [];
+  const memberCount = members.length || 1;
+  // The organizer can move an entry to another category after the team has
+  // selected it as the representative for this one. That leaves the stored
+  // rep pointing outside the group, so the selection no longer means
+  // anything and has to be made again rather than silently ignored.
+  const repValid = !!g.repEntryId && (members.length === 0 || members.includes(g.repEntryId));
 
-  const out = {
-    n,
-    expected: expectedJudges,
-    judgeScores,
-    score: null,
-    tier: null,
-    finalTier: null,
-    spread: 0,
-    outlierSlot: null,
-    flags: [],
-    complete: false,
-    headConfirm: headConfirm || null,
-  };
+  const marks = Object.entries(g.marks || {})
+    .map(([slot, value]) => ({ slot: Number(slot), value }))
+    .filter((m) => m.value !== null && m.value !== undefined && !Number.isNaN(Number(m.value)))
+    .sort((a, x) => a.slot - x.slot);
 
-  if (n === 0) {
-    out.flags.push({ key: 'unjudged', text: 'Not yet judged' });
-    return out;
-  }
+  const n = marks.length;
+  const total = marks.reduce((sum, m) => sum + Number(m.value), 0);
+  const complete = n >= expected;
 
-  const values = judgeScores.map((j) => j.score);
-  const avg = values.reduce((a, b) => a + b, 0) / n;
-  out.score = Math.round(avg);
-  out.tier = tierFor(out.score);
-  out.finalTier = out.tier;
-  out.spread = n > 1 ? Math.max(...values) - Math.min(...values) : 0;
+  const needsScope = memberCount > 1;
+  const scopeSet = !needsScope || g.scope === 'collection' || (g.scope === 'representative' && repValid);
 
-  if (n < 2) {
-    out.flags.push({ key: 'incomplete', text: 'One judge only — needs a second score before any award stands' });
-    return out;
-  }
+  const provisional = medalFor(total, expected);
+  const ruled = !!g.ruling;
+  const finalMedal = ruled ? medalByKey(g.ruling) : complete && scopeSet ? provisional : null;
 
-  out.complete = n >= Math.min(2, expectedJudges);
-
-  // Two judges: no majority exists, so disagreement has to be resolved explicitly.
-  if (n === 2 && out.spread > LIMITS.divergence) {
-    out.flags.push({
-      key: 'reconcile',
-      text: `Judges are ${fmt1(out.spread)} points apart — reconcile before the tier stands`,
+  const flags = [];
+  if (!scopeSet) {
+    flags.push({
+      key: 'unselected',
+      text: `${memberCount} pieces from this exhibitor in this category. The team decides together whether to judge one as representative of the group, or to judge the whole collection as one.`,
     });
   }
-
-  // Three or more judges: the panel self-corrects, but a lone outlier is worth a look.
-  if (n >= 3) {
-    let worstIdx = -1;
-    let worstDev = 0;
-    values.forEach((v, i) => {
-      const others = values.filter((_, k) => k !== i);
-      const dev = Math.abs(v - others.reduce((a, b) => a + b, 0) / others.length);
-      if (dev > worstDev) { worstDev = dev; worstIdx = i; }
-    });
-    if (worstDev > LIMITS.outlier) {
-      out.outlierSlot = judgeScores[worstIdx].slot;
-      out.flags.push({
-        key: 'outlier',
-        text: `Judge ${out.outlierSlot} sits ${fmt1(worstDev)} points off the other two — worth a second look`,
+  if (scopeSet && !complete) {
+    flags.push({ key: 'incomplete', text: `${n} of ${expected} judges' marks are in.` });
+  }
+  if (n >= 2) {
+    const values = marks.map((m) => Number(m.value));
+    const spread = Math.max(...values) - Math.min(...values);
+    if (spread >= SPREAD_FLAG_AT) {
+      flags.push({
+        key: 'spread',
+        text: `Marks range from ${Math.min(...values)} to ${Math.max(...values)}. Flagged for the Awards Committee Chairman, who has the final say. The total stands unless he rules otherwise.`,
       });
     }
   }
-
-  // Boundary band: on a two-judge panel, one point can swing a tier.
-  if (n === 2) {
-    const upper = TIERS[TIERS.findIndex((t) => t.key === out.tier.key) - 1];
-    const nearLine = upper && upper.min - out.score <= LIMITS.boundary;
-    if (nearLine) {
-      if (out.headConfirm === 'up') {
-        out.finalTier = nextTierUp(out.tier);
-        out.flags.push({ key: 'confirmed', text: `Head judge moved this up to ${out.finalTier.name}` });
-      } else if (out.headConfirm === 'hold') {
-        out.flags.push({ key: 'confirmed', text: `Head judge held this at ${out.tier.name}` });
-      } else {
-        out.flags.push({
-          key: 'boundary',
-          text: `Within ${LIMITS.boundary} points of ${upper.name} (${upper.min}) — head judge decides`,
-        });
-      }
-    }
+  if (ruled) {
+    flags.push({
+      key: 'ruled',
+      text: `The Awards Committee Chairman set this to ${medalByKey(g.ruling)?.name || g.ruling}${g.rulingNote ? ` — ${g.rulingNote}` : ''}.`,
+    });
   }
 
-  return out;
+  return {
+    marks, n, expected, total,
+    max: b.max,
+    scope: needsScope ? g.scope : 'single',
+    repEntryId: repValid ? g.repEntryId : null,
+    needsScope, scopeSet, complete, ruled,
+    provisionalMedal: provisional,
+    finalMedal,
+    flags,
+  };
 }
 
-export function reconciliationText(k) {
-  if (k === 'reconcile') {
-    return ` Compare line by line, discuss only the criteria that differ by ${LIMITS.criterionGap} or more, and re-mark those. Still apart? Bring in the head judge as a third score.`;
-  }
-  if (k === 'outlier') return ' The tier stands unless a judge changes a mark.';
-  if (k === 'boundary') return ' Move it up or hold it — the decision is recorded against the entry.';
-  return '';
-}
-
-export function flagLabel(k) {
-  return (
-    {
-      reconcile: 'Reconcile',
-      outlier: 'Outlier',
-      boundary: 'Head judge',
-      confirmed: 'Settled',
-      incomplete: 'Incomplete',
-      unjudged: 'Waiting',
-    }[k] || k
-  );
+/* Convenience for display: "8 / 12" */
+export function fmtPoints(total, max) {
+  return `${total} / ${max}`;
 }
