@@ -361,6 +361,23 @@ function GlobalStyles() {
         .printdoc th { text-align: left; border-bottom: 1pt solid #000; padding: 4pt 6pt; font-family: 'JetBrains Mono', monospace; font-size: 8pt; text-transform: uppercase; letter-spacing: .08em; }
         .printdoc td { padding: 4pt 6pt; border-bottom: 0.5pt solid #ccc; vertical-align: top; }
 
+        /* Awards sheet: category → medal → recipients. Each category block and
+           each recipient line avoids splitting across a page break, so a name
+           never ends up orphaned from the medal it won. */
+        .printdoc h3 { font-family: 'Oswald', sans-serif; font-size: 12.5pt; margin: 12pt 0 2pt; }
+        .printdoc .cat { page-break-inside: avoid; break-inside: avoid; margin-bottom: 6pt; }
+        .printdoc .medalgroup { margin: 0 0 5pt; }
+        .printdoc .medalhead {
+          font-family: 'JetBrains Mono', monospace; font-size: 8pt; letter-spacing: .12em;
+          text-transform: uppercase; border-bottom: 0.5pt solid #999; padding-bottom: 1pt;
+          margin: 5pt 0 3pt;
+        }
+        .printdoc .awardline { margin-bottom: 3.5pt; page-break-inside: avoid; break-inside: avoid; }
+        .printdoc .awardline .who { font-size: 10.5pt; }
+        .printdoc .awardline .pts { font-family: 'JetBrains Mono', monospace; font-size: 8pt; color: #555; }
+        .printdoc .awardline .scope { font-size: 8.5pt; font-style: italic; color: #444; padding-left: 10pt; }
+        .printdoc .awardline .piece { font-size: 9.5pt; padding-left: 16pt; }
+
         /* full-page table sign: legible from a few feet away, meant to
            stand alone on an easel or lie flat on the registration table.
            Deliberately does NOT rely on a fixed height + flex centering to
@@ -2172,9 +2189,69 @@ function TagCard({ entry, config }) {
   );
 }
 
+/* Announcement order: bronze first, building to gold. The sheet is read out
+   at the ceremony as well as filed, so it follows the order it will be
+   spoken in rather than ranking best-first. */
+const ANNOUNCE_ORDER = ['bronze', 'silver', 'gold'];
+
+/* One recipient line. The representative/collection distinction has to survive
+   onto paper, so a collection award names the exhibitor and lists its pieces
+   underneath, while a representative award names the piece that was judged and
+   says what it stood for. */
+function AwardLines({ row }) {
+  const note = awardScopeNote(row);
+  const total = `${row.result.total}/${row.result.max}`;
+  const ruled = row.result.ruled ? ' · Chairman ruling' : '';
+
+  if (row.result.scope === 'collection') {
+    return (
+      <div className="awardline">
+        <div className="who">
+          {row.group.name} <span className="pts">{total}{ruled}</span>
+        </div>
+        <div className="scope">{note}</div>
+        {row.group.entries.map((e) => (
+          <div className="piece" key={e.id}>#{pad(e.number)} {e.modelName}</div>
+        ))}
+      </div>
+    );
+  }
+
+  const piece = row.rep || row.group.entries[0];
+  return (
+    <div className="awardline">
+      <div className="who">
+        #{pad(piece.number)} {piece.modelName} — {row.group.name} <span className="pts">{total}{ruled}</span>
+      </div>
+      {note && <div className="scope">{note}</div>}
+    </div>
+  );
+}
+
 function ResultsSheet({ config, entries, groupRecords }) {
   const { rows } = buildAwards(entries, groupRecords, config);
   const teamLine = (config.teams || []).map((t) => `${t.name} (${t.judgeCount} judges)`).join(' · ');
+
+  // Category order follows the configured list, so the printed sheet matches
+  // the order categories appear everywhere else in the app.
+  const byCategory = config.categories.map((c) => {
+    const catRows = rows.filter(
+      (r) => r.group.categoryId === c.id && r.result.finalMedal && r.result.finalMedal.key !== 'none'
+    );
+    const medals = ANNOUNCE_ORDER
+      .map((key) => ({
+        medal: medalByKey(key),
+        list: catRows
+          .filter((r) => r.result.finalMedal.key === key)
+          .sort((a, b) => b.result.total - a.result.total),
+      }))
+      .filter((m) => m.list.length > 0);
+    return { category: c, medals, count: catRows.length };
+  });
+
+  const awarded = byCategory.filter((x) => x.count > 0);
+  const empty = byCategory.filter((x) => x.count === 0);
+
   return (
     <div className="printdoc">
       <h1>{config.name}</h1>
@@ -2182,6 +2259,35 @@ function ResultsSheet({ config, entries, groupRecords }) {
         {config.date} · Open judging system · {teamLine}
         {config.chairmanName ? ` · Awards Committee Chairman: ${config.chairmanName}` : ''}
       </p>
+
+      <h2>Medals by category</h2>
+      <p style={{ fontSize: '8.5pt' }}>
+        Listed in announcement order — Bronze, then Silver, then Gold. Medals are earned against the standard, so
+        any number of entries can hold the same one. Where an exhibitor entered several pieces in a category, the
+        team either judged the single best piece as representative of the group, or judged the whole collection
+        together and awarded every piece in it — the line under each recipient says which.
+      </p>
+
+      {awarded.length === 0 && <p>No medals have been awarded yet.</p>}
+
+      {awarded.map(({ category, medals }) => (
+        <div className="cat" key={category.id}>
+          <h3>{category.name}</h3>
+          {medals.map(({ medal, list }) => (
+            <div className="medalgroup" key={medal.key}>
+              <div className="medalhead">{medal.name} · {list.length}</div>
+              {list.map((row) => <AwardLines key={row.group.key} row={row} />)}
+            </div>
+          ))}
+        </div>
+      ))}
+
+      {empty.length > 0 && (
+        <p style={{ fontSize: '8.5pt', marginTop: '8pt' }}>
+          <em>No medals awarded in: {empty.map((x) => x.category.name).join(', ')}.</em>
+        </p>
+      )}
+
       <h2>Special awards</h2>
       <table>
         <thead><tr><th style={{ width: '40%' }}>Award</th><th>Recipient</th></tr></thead>
@@ -2197,42 +2303,6 @@ function ResultsSheet({ config, entries, groupRecords }) {
               <tr key={a.id}>
                 <td>{a.name}{a.useShowTheme ? <><br /><em style={{ fontSize: '8pt' }}>{config.showTheme}</em></> : null}</td>
                 <td>{names.length ? names.map((n, i) => <div key={i}>{n}</div>) : '—'}</td>
-              </tr>
-            );
-          })}
-        </tbody>
-      </table>
-      <h2>Medals</h2>
-      <p style={{ fontSize: '8.5pt' }}>
-        Judged by group — one exhibitor's pieces within one category. Where a group holds more than one piece, the
-        team either judged the single best piece as representative of the group (only that piece is medalled) or
-        judged the whole collection as one (every piece takes the medal). The Award column says which.
-      </p>
-      <table>
-        <thead>
-          <tr>
-            <th>Exhibitor</th><th>Category</th><th>Award</th><th>Pieces medalled</th><th>Points</th><th>Medal</th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((row) => {
-            const note = awardScopeNote(row) || 'Single piece';
-            const list = row.medalled.length ? row.medalled : [];
-            return (
-              <tr key={row.group.key}>
-                <td>{row.group.name}</td>
-                <td>{categoryName(config, row.group.categoryId)}</td>
-                <td>{note}</td>
-                <td>
-                  {list.length === 0
-                    ? '—'
-                    : list.map((e) => <div key={e.id}>#{pad(e.number)} {e.modelName}</div>)}
-                </td>
-                <td>{row.result.finalMedal ? `${row.result.total} / ${row.result.max}` : '—'}</td>
-                <td>
-                  {row.result.finalMedal ? row.result.finalMedal.name : '—'}
-                  {row.result.ruled ? ' (Chairman)' : ''}
-                </td>
               </tr>
             );
           })}
