@@ -70,6 +70,26 @@ function forgetMyEntries() {
   lsRemove(MY_ENTRIES_KEY);
 }
 
+/* One write, one retry, then an honest failure.
+
+   The intermittent "could not save" people were seeing came from single-shot
+   writes: a Supabase token refreshing mid-session or a dropped request on
+   venue wifi fails once and succeeds immediately after. Retrying silently
+   removes almost all of those. If the retry also fails the change really did
+   not persist, and the message says so rather than implying it might have. */
+async function writeKey(key, value) {
+  const payload = JSON.stringify(value);
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      await window.storage.set(key, payload, true);
+      return true;
+    } catch (e) {
+      if (attempt === 0) await new Promise((r) => setTimeout(r, 400));
+    }
+  }
+  return false;
+}
+
 async function safeGet(key, shared) {
   try {
     const res = await window.storage.get(key, shared);
@@ -2527,8 +2547,8 @@ export default function App() {
     // random ids again, and any entry registered under the first set in
     // the meantime would point at a category id that no longer exists.
     if (rawConfig && normalized.categories.length !== (rawConfig.categories || []).length) {
-      try { await window.storage.set('brushscore:config', JSON.stringify(normalized), true); }
-      catch (e) { /* best effort — it simply re-merges next load if this fails */ }
+      // Best effort — it simply re-merges on the next load if this fails.
+      await writeKey('brushscore:config', normalized);
     }
   }, []);
 
@@ -2546,28 +2566,61 @@ export default function App() {
 
   const saveConfigNow = async (cfg) => {
     setConfig(cfg);
-    try { await window.storage.set('brushscore:config', JSON.stringify(cfg), true); }
-    catch (e) { notify('Could not save settings.', 'error'); }
+    if (await writeKey('brushscore:config', cfg)) return true;
+    notify('Not saved — check your connection and redo that change.', 'error');
+    return false;
   };
 
   const saveEntriesNow = async (list) => {
     setEntries(list);
-    try { await window.storage.set('brushscore:entries', JSON.stringify(list), true); }
-    catch (e) { notify('Could not save — try again.', 'error'); }
+    if (await writeKey('brushscore:entries', list)) return true;
+    notify('Not saved — check your connection and redo that change.', 'error');
+    return false;
+  };
+
+  /* Read the stored list back before changing it, rather than trusting this
+     device's copy.
+
+     The desk tablet and a phone can both have the app open. If the phone
+     registered someone after this tablet loaded, then checking a different
+     entrant in from the tablet would write the tablet's in-memory list —
+     which never contained that registration — and silently erase it.
+     addEntry already re-read for this reason; every other entry mutation
+     now does too. */
+  const mutateEntries = async (fn) => {
+    const raw = await safeGet('brushscore:entries', true);
+    const latest = (raw ? JSON.parse(raw) : entries).map(normalizeEntry);
+    const next = fn(latest);
+    const ok = await saveEntriesNow(next);
+    return { ok, list: next };
+  };
+
+  /* Same hazard on the config blob: two organizers assigning different
+     special awards would otherwise overwrite each other's. */
+  const mutateConfig = async (fn) => {
+    const raw = await safeGet('brushscore:config', true);
+    const latest = raw ? normalizeConfig(JSON.parse(raw)) : config;
+    const next = fn(latest);
+    const ok = await saveConfigNow(next);
+    return { ok, config: next };
   };
 
   /* Group decisions are written by several judges on several devices at once,
      so each write re-reads the store and patches only its own group before
      saving. Two judges marking different groups seconds apart would otherwise
-     each save a whole snapshot and the later one would erase the earlier. */
+     each save a whole snapshot and the later one would erase the earlier.
+     `patch` may be a function of the current record, which lets callers derive
+     their change from the freshly-read copy without reading it twice. */
   const patchGroup = async (key, patch) => {
     const raw = await safeGet('brushscore:groups', true);
     const latest = raw ? JSON.parse(raw) : groupRecords;
     const current = latest[key] || emptyGroup(key);
-    const next = { ...latest, [key]: { ...current, ...patch } };
+    const delta = typeof patch === 'function' ? patch(current) : patch;
+    const next = { ...latest, [key]: { ...current, ...delta } };
     setGroupRecords(next);
-    try { await window.storage.set('brushscore:groups', JSON.stringify(next), true); }
-    catch (e) { notify('Could not save — try again.', 'error'); }
+    if (!(await writeKey('brushscore:groups', next))) {
+      notify('Not saved — check your connection and redo that mark.', 'error');
+    }
     return next;
   };
 
@@ -2585,13 +2638,12 @@ export default function App() {
   };
 
   const setGroupMark = async (key, seat, value, teamId) => {
-    const raw = await safeGet('brushscore:groups', true);
-    const latest = raw ? JSON.parse(raw) : groupRecords;
-    const current = latest[key] || emptyGroup(key);
-    const marks = { ...current.marks };
-    if (value === null || value === undefined) delete marks[seat];
-    else marks[seat] = value;
-    await patchGroup(key, { marks, teamId: current.teamId || teamId || null });
+    await patchGroup(key, (current) => {
+      const marks = { ...current.marks };
+      if (value === null || value === undefined) delete marks[seat];
+      else marks[seat] = value;
+      return { marks, teamId: current.teamId || teamId || null };
+    });
   };
 
   const setChairmanRuling = async (key, medalKey, note) => {
@@ -2624,8 +2676,7 @@ export default function App() {
   };
 
   const updateEntry = async (id, patch) => {
-    const newEntries = entries.map((e) => (e.id === id ? { ...e, ...patch } : e));
-    await saveEntriesNow(newEntries);
+    await mutateEntries((list) => list.map((e) => (e.id === id ? { ...e, ...patch } : e)));
   };
 
   const checkIn = async (id, val) => {
@@ -2634,29 +2685,35 @@ export default function App() {
   };
 
   const assignAward = async (awardId, value) => {
-    const newConfig = { ...config, specialAwards: { ...config.specialAwards, [awardId]: value } };
-    await saveConfigNow(newConfig);
+    await mutateConfig((latest) => ({
+      ...latest,
+      specialAwards: { ...(latest.specialAwards || {}), [awardId]: value },
+    }));
   };
 
   const deleteEntry = async (id) => {
-    const newEntries = entries.filter((e) => e.id !== id);
-    await saveEntriesNow(newEntries);
+    const { list } = await mutateEntries((entryList) => entryList.filter((e) => e.id !== id));
     // Drop any group the deletion emptied out. Without this, an exhibitor
     // removed and later re-registered under the same name and category would
     // silently inherit the old team's marks and ruling.
-    const live = new Set(buildGroups(newEntries).map((g) => g.key));
-    const pruned = Object.fromEntries(Object.entries(groupRecords).filter(([k]) => live.has(k)));
-    if (Object.keys(pruned).length !== Object.keys(groupRecords).length) {
+    const live = new Set(buildGroups(list).map((g) => g.key));
+    const raw = await safeGet('brushscore:groups', true);
+    const latestGroups = raw ? JSON.parse(raw) : groupRecords;
+    const pruned = Object.fromEntries(Object.entries(latestGroups).filter(([k]) => live.has(k)));
+    if (Object.keys(pruned).length !== Object.keys(latestGroups).length) {
       setGroupRecords(pruned);
-      try { await window.storage.set('brushscore:groups', JSON.stringify(pruned), true); }
-      catch (e) { /* best effort — the stale record is inert until that name and category recur */ }
+      // Best effort — a stale record is inert until that name and category recur.
+      await writeKey('brushscore:groups', pruned);
     }
     notify('Entry removed.');
   };
 
   const publishToggle = async () => {
-    const newStatus = config.status === 'published' ? 'open' : 'published';
-    await saveConfigNow({ ...config, status: newStatus });
+    let newStatus = 'open';
+    await mutateConfig((latest) => {
+      newStatus = latest.status === 'published' ? 'open' : 'published';
+      return { ...latest, status: newStatus };
+    });
     notify(newStatus === 'published' ? 'Results published!' : 'Results unpublished.');
   };
 

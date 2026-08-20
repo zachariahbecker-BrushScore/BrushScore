@@ -4,11 +4,15 @@ A standalone build of the model/hobby show manager — registration, check-in,
 judging, organizer admin, and results — running on your own domain instead
 of inside Claude.
 
-The app code (`src/App.jsx`) is unchanged from the original. The only thing
-that's different is where the data lives: instead of Claude's built-in
-artifact storage, it now talks to a small Supabase database via
-`src/storageShim.js`, which mimics the same interface so nothing else had to
-change.
+Data lives in a small Supabase database rather than Claude's built-in
+artifact storage. A shim exposes the same `window.storage` interface the app
+expects (`get` / `set`), so the app code itself never had to care where the
+data went.
+
+Judging uses the **Open system** used at most U.S. figure exhibitions —
+teams of judges, one 0–4 mark per piece or group, medals earned against a
+standard rather than won in competition. See `CHANGES.md` for the full
+description and `DEPLOY.md` for the deploy checklist.
 
 ## 1\. Create a Supabase project
 
@@ -64,9 +68,13 @@ deployed — it just won't work over plain `http://`.
 denied, the scanner shows a message and the manual entry field still
 works.
 
-The QR decoding library (`jsQR`) and the QR image generator
-(`api.qrserver.com`) are both loaded from the browser at runtime rather than
-bundled — no new npm dependency was needed.
+QR codes are **generated locally** by `src/qrcode.js` — no network call, and
+no model title or entrant name ever leaves the browser to render a code.
+
+QR *decoding* is different: the scanner pulls `jsQR` from a CDN the moment
+you tap Scan, so scanning needs working internet even though generating does
+not. If venue wifi is unreliable, check-in by name search still works, and a
+USB barcode scanner avoids the problem entirely.
 
 ## Notes / limitations carried over from the original
 
@@ -74,9 +82,16 @@ bundled — no new npm dependency was needed.
 login security — anyone with your site's URL and dev tools could read the
 underlying data. Fine for a club show; if that ever matters more, Supabase
 has built-in auth you could wire in later.
-* Data model is intentionally simple: one row for show config, one row for
-the full entries list, both in the `brushscore_kv` table. That's plenty for
-a single event; if you want multiple shows running independently, give
-each its own set of keys (e.g. prefix them per show) or its own project.
+* Data model is intentionally simple: three rows in the `brushscore_kv`
+table — `brushscore:config` (show settings, teams, special awards),
+`brushscore:entries` (the full entry list), and `brushscore:groups` (the
+judging teams' decisions and marks). That's plenty for a single event; if
+you want multiple shows running independently, give each its own set of
+keys (e.g. prefix them per show) or its own project.
+* Because each of those is one row holding one blob, every write replaces
+the whole list. Writes re-read before modifying so two devices don't
+overwrite each other, and retry once on failure — but if a write fails
+twice you get an explicit "Not saved" message, and that change really
+didn't land.
 * No offline support — it needs a network connection to read/write.
 
