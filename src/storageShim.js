@@ -97,4 +97,52 @@ async function list(prefix = '') {
    straight away. */
 window.storage = { get, set, delete: del, list };
 
+/* Diagnostic, callable from the browser console as brushscoreCheck().
+   Exercises read, write and read-back against a scratch key and reports
+   exactly which step fails and why — which is far quicker than inferring a
+   cause from a "not saved" toast. */
+window.brushscoreCheck = async function brushscoreCheck() {
+  const out = (label, ok, extra) =>
+    // eslint-disable-next-line no-console
+    console.log(`${ok ? 'PASS' : 'FAIL'}  ${label}`, extra ?? '');
+
+  out('env vars present', isConfigured, isConfigured ? '' : 'set VITE_SUPABASE_* and REDEPLOY');
+  if (!isConfigured) return;
+
+  try {
+    const cfg = await get('brushscore:config');
+    out('read config', true, cfg ? `${(cfg.value || '').length} bytes` : 'no row yet');
+  } catch (e) {
+    out('read config', false, e);
+    return;
+  }
+
+  // Writes are restricted to the app's three keys, so test on a real one by
+  // reading it and writing the identical value straight back.
+  try {
+    const existing = await get('brushscore:groups');
+    const value = existing ? existing.value : '{}';
+    await set('brushscore:groups', value);
+    out('write groups', true, `${value.length} bytes`);
+  } catch (e) {
+    out('write groups', false, {
+      message: e?.message, code: e?.code, details: e?.details, hint: e?.hint,
+    });
+    // eslint-disable-next-line no-console
+    console.log(
+      'A code of 42501 or a message about row-level security means the ' +
+      'write policy is rejecting it — re-run section 3 of supabase-setup.sql.'
+    );
+    return;
+  }
+
+  try {
+    const entries = await get('brushscore:entries');
+    const list = entries ? JSON.parse(entries.value) : [];
+    out('entries parse', Array.isArray(list), `${Array.isArray(list) ? list.length : '?'} entries`);
+  } catch (e) {
+    out('entries parse', false, e);
+  }
+};
+
 export default window.storage;

@@ -79,14 +79,29 @@ function forgetMyEntries() {
    not persist, and the message says so rather than implying it might have. */
 async function writeKey(key, value) {
   const payload = JSON.stringify(value);
+  let lastError = null;
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
       await window.storage.set(key, payload, true);
       return true;
     } catch (e) {
+      lastError = e;
       if (attempt === 0) await new Promise((r) => setTimeout(r, 400));
     }
   }
+  /* Both attempts failed. The toast can only say "not saved"; the actual
+     cause — an RLS policy rejection, an expired key, a payload too large —
+     is in the error object, so put it somewhere findable rather than
+     discarding it. */
+  // eslint-disable-next-line no-console
+  console.error('[BrushScore] write failed:', key, {
+    message: lastError?.message,
+    code: lastError?.code,
+    details: lastError?.details,
+    hint: lastError?.hint,
+    bytes: payload.length,
+    error: lastError,
+  });
   return false;
 }
 

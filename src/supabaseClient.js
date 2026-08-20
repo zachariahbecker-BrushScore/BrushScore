@@ -25,4 +25,8 @@ if (!isConfigured) {
 
 export const supabase = isConfigured ? createClient(url, anonKey) : null;
 
+/* Lowercase and unquoted, which is what Postgres produces naturally — a
+   mixed-case name would have to be double-quoted in every SQL statement
+   forever, and writing it bare just once silently creates a second, separate
+   table. This must match the table name in supabase-setup.sql exactly. */
 export const TABLE = 'brushscore_kv';
