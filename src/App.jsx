@@ -35,11 +35,26 @@ function categoryName(config, id) { return config.categories.find((c) => c.id ==
 
    Walk-ins are deliberately not remembered: they are submitted on the desk's
    device, not the registrant's, and the tag is printed on the spot. */
+/* Browsers throw a SecurityError on any localStorage access — not just on
+   write — when site data is blocked (Chrome's "block all cookies", Safari in
+   some configurations, embedded webviews). That would take down whichever
+   screen touched it, so every access goes through these and degrades to
+   "remembers nothing" rather than a blank page. */
+function lsGet(key) {
+  try { return localStorage.getItem(key); } catch (e) { return null; }
+}
+function lsSet(key, value) {
+  try { localStorage.setItem(key, value); } catch (e) { /* storage blocked or full */ }
+}
+function lsRemove(key) {
+  try { localStorage.removeItem(key); } catch (e) { /* nothing to do */ }
+}
+
 const MY_ENTRIES_KEY = 'brushscore:myEntries';
 
 function readMyEntries() {
   try {
-    const raw = localStorage.getItem(MY_ENTRIES_KEY);
+    const raw = lsGet(MY_ENTRIES_KEY);
     const list = raw ? JSON.parse(raw) : [];
     return Array.isArray(list) ? list : [];
   } catch (e) {
@@ -47,17 +62,12 @@ function readMyEntries() {
   }
 }
 function rememberMyEntry(entry) {
-  try {
-    const list = readMyEntries().filter((x) => x.id !== entry.id);
-    list.push({ id: entry.id, number: entry.number });
-    localStorage.setItem(MY_ENTRIES_KEY, JSON.stringify(list));
-  } catch (e) {
-    // Storage can be unavailable (private browsing, storage full). Losing the
-    // reminder is not worth failing a registration over.
-  }
+  const list = readMyEntries().filter((x) => x.id !== entry.id);
+  list.push({ id: entry.id, number: entry.number });
+  lsSet(MY_ENTRIES_KEY, JSON.stringify(list));
 }
 function forgetMyEntries() {
-  try { localStorage.removeItem(MY_ENTRIES_KEY); } catch (e) { /* nothing to do */ }
+  lsRemove(MY_ENTRIES_KEY);
 }
 
 async function safeGet(key, shared) {
@@ -1422,11 +1432,11 @@ function GroupCard({ group, config, record, teamId, seat, judgeName, onSetScope,
 function JudgeView({ config, entries, groupRecords, onSetScope, onSetMark, notify }) {
   const teams = config.teams || [];
   const [teamId, setTeamId] = useState(() => {
-    const saved = localStorage.getItem('brushscore:teamId');
+    const saved = lsGet('brushscore:teamId');
     return teams.some((t) => t.id === saved) ? saved : teams[0]?.id;
   });
   const [seat, setSeat] = useState(() => {
-    const saved = Number(localStorage.getItem('brushscore:judgeSeat'));
+    const saved = Number(lsGet('brushscore:judgeSeat'));
     return saved >= 1 && saved <= 3 ? saved : 1;
   });
 
@@ -1437,8 +1447,8 @@ function JudgeView({ config, entries, groupRecords, onSetScope, onSetMark, notif
     // pointing at a seat that no longer exists.
     if (!teams.some((t) => t.id === teamId) && teams[0]) setTeamId(teams[0].id);
     else if (team && seat > Number(team.judgeCount)) setSeat(1);
-    localStorage.setItem('brushscore:teamId', String(teamId || ''));
-    localStorage.setItem('brushscore:judgeSeat', String(seat));
+    lsSet('brushscore:teamId', String(teamId || ''));
+    lsSet('brushscore:judgeSeat', String(seat));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [teamId, seat, teams.length, team?.judgeCount]);
 
