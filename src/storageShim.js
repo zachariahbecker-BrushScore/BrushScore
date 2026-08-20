@@ -1,46 +1,100 @@
-// Re-implements the window.storage.{get,set,delete,list} interface that the
-// app was originally written against (Claude artifact storage), backed by a
-// single key/value table in Supabase. App.jsx is unchanged — it just calls
-// window.storage as before.
-import { supabase } from './supabaseClient';
+/* ---------------------------------------------------------------------------
+   storageShim.js — window.storage, backed by Supabase
 
-const TABLE = 'brushscore_kv';
+   App.jsx was written against the key/value storage API it had inside Claude:
 
-async function get(key, _shared) {
-  const { data, error } = await supabase.from(TABLE).select('value').eq('key', key).maybeSingle();
+     await window.storage.get(key, shared)     -> { key, value } | null
+     await window.storage.set(key, value, shared)
+     await window.storage.delete(key, shared)
+     await window.storage.list(prefix, shared)
+
+   This reproduces that interface on top of one Postgres table, so the app
+   itself never has to know where the data went. `value` is always a STRING at
+   this boundary — the app hands over JSON.stringify(...) and expects the same
+   string back.
+
+   The `shared` argument is accepted and ignored: there is a single shared
+   table and no per-user scoping. Everyone with the link sees the same show.
+
+   IMPORTANT: set() throws on failure rather than swallowing the error. App.jsx
+   relies on that — it retries once and only then tells the user a change did
+   not save. A shim that silently succeeded would turn every failed write into
+   invisible data loss.
+--------------------------------------------------------------------------- */
+
+import { supabase, isConfigured, TABLE } from './supabaseClient';
+
+/* Values are stored as real jsonb rather than as an opaque string, so the
+   Supabase table stays readable and queryable in the dashboard — which is
+   what makes the history/restore in supabase-setup.sql actually usable.
+
+   Reads tolerate both shapes. An older row written as a JSON *string* scalar
+   comes back as a string and is passed through untouched; a row written as an
+   object or array is re-stringified. Without that, rows saved by an earlier
+   build would come back double-encoded and fail to parse. */
+function toStored(value) {
+  if (typeof value !== 'string') return value;
+  try {
+    return JSON.parse(value);
+  } catch (e) {
+    return value; // not JSON — store the string as-is
+  }
+}
+
+function fromStored(value) {
+  if (value === null || value === undefined) return null;
+  return typeof value === 'string' ? value : JSON.stringify(value);
+}
+
+function requireClient() {
+  if (!isConfigured || !supabase) {
+    throw new Error(
+      'BrushScore storage is not configured — set VITE_SUPABASE_URL and ' +
+      'VITE_SUPABASE_ANON_KEY and rebuild.'
+    );
+  }
+}
+
+async function get(key) {
+  requireClient();
+  const { data, error } = await supabase
+    .from(TABLE)
+    .select('key, value')
+    .eq('key', key)
+    .maybeSingle();
   if (error) throw error;
   if (!data) return null;
-  return { key, value: JSON.stringify(data.value), shared: true };
+  return { key: data.key, value: fromStored(data.value) };
 }
 
-async function set(key, value, _shared) {
-  let parsed;
-  try {
-    parsed = JSON.parse(value);
-  } catch {
-    parsed = value;
-  }
+async function set(key, value) {
+  requireClient();
   const { error } = await supabase
     .from(TABLE)
-    .upsert({ key, value: parsed, updated_at: new Date().toISOString() }, { onConflict: 'key' });
+    .upsert({ key, value: toStored(value), updated_at: new Date().toISOString() },
+            { onConflict: 'key' });
   if (error) throw error;
-  return { key, value, shared: true };
+  return { key, value };
 }
 
-async function del(key, _shared) {
+async function del(key) {
+  requireClient();
   const { error } = await supabase.from(TABLE).delete().eq('key', key);
   if (error) throw error;
-  return { key, deleted: true, shared: true };
+  return { key, deleted: true };
 }
 
-async function list(prefix = '', _shared) {
-  let query = supabase.from(TABLE).select('key');
-  if (prefix) query = query.like('key', `${prefix}%`);
-  const { data, error } = await query;
+async function list(prefix = '') {
+  requireClient();
+  let q = supabase.from(TABLE).select('key');
+  if (prefix) q = q.like('key', `${prefix}%`);
+  const { data, error } = await q;
   if (error) throw error;
-  return { keys: (data || []).map((d) => d.key), prefix, shared: true };
+  return { keys: (data || []).map((r) => r.key), prefix };
 }
 
-if (typeof window !== 'undefined') {
-  window.storage = { get, set, delete: del, list };
-}
+/* Attached before React renders (see main.jsx) so the first load can read
+   straight away. */
+window.storage = { get, set, delete: del, list };
+
+export default window.storage;

@@ -1,3 +1,20 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+/* App.jsx injects its own <style> block for the BrushScore-specific bits
+   (fonts, the blueprint grid, print layouts). This file only needs to pull in
+   Tailwind, which supplies every utility class the components rely on —
+   without it the app renders as unstyled full-width text. */
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: #f8fafc; /* slate-50, matching the app shell */
+  -webkit-font-smoothing: antialiased;
+}
