@@ -710,16 +710,43 @@ function RoleCard({ icon: Icon, title, desc, onClick, accent }) {
   );
 }
 
-function MyEntriesPanel({ config, entries, onPrintTag }) {
-  const [mine, setMine] = useState(readMyEntries);
-  // Match on id, then fall back to the entry number — an entry deleted and
-  // re-added by the desk keeps its number but not its id.
-  const found = mine
+/* Resolve the remembered id/number pairs against the live entry list.
+   Matches on id, then falls back to the entry number — an entry deleted and
+   re-added by the desk keeps its number but not its id. Anything that
+   resolves to nothing (deleted outright) simply drops off the list. */
+function findMyEntries(entries) {
+  return readMyEntries()
     .map((m) => entries.find((e) => e.id === m.id) || entries.find((e) => e.number === m.number))
     .filter(Boolean);
+}
+
+/* One remembered entry. Shared by the home-page panel and the standalone
+   page so the two can't drift apart. */
+function MyEntryRow({ config, entry, onPrintTag }) {
+  return (
+    <div className="flex items-center gap-3 border border-slate-100 rounded-lg p-2.5">
+      <EntryBadge number={entry.number} size="sm" />
+      <div className="flex-1 min-w-0">
+        <p className="font-medium text-slate-900 truncate text-sm">{entry.modelName}</p>
+        <p className="text-xs text-slate-500 truncate">
+          {categoryName(config, entry.categoryId)}
+          {entry.checkedIn ? <span className="text-teal-700 font-semibold"> · Checked in</span> : ''}
+        </p>
+      </div>
+      <QrCode value={entryQrPayload(entry.number)} size={40} className="shrink-0 rounded border border-slate-200" />
+      <button onClick={() => onPrintTag(entry)} aria-label={`Print tag for entry ${entry.number}`} className="shrink-0 p-2 text-slate-400 hover:text-slate-700">
+        <Printer size={15} />
+      </button>
+    </div>
+  );
+}
+
+function MyEntriesPanel({ config, entries, onPrintTag }) {
+  const [cleared, setCleared] = useState(false);
+  const found = cleared ? [] : findMyEntries(entries);
   if (found.length === 0) return null;
 
-  const clear = () => { forgetMyEntries(); setMine([]); };
+  const clear = () => { forgetMyEntries(); setCleared(true); };
 
   return (
     <div className="max-w-3xl mx-auto px-4 pb-6">
@@ -734,24 +761,60 @@ function MyEntriesPanel({ config, entries, onPrintTag }) {
           Registered from this device. Lost your tag? Reprint it here, or ask at the registration desk.
         </p>
         <div className="space-y-2">
-          {found.map((e) => (
-            <div key={e.id} className="flex items-center gap-3 border border-slate-100 rounded-lg p-2.5">
-              <EntryBadge number={e.number} size="sm" />
-              <div className="flex-1 min-w-0">
-                <p className="font-medium text-slate-900 truncate text-sm">{e.modelName}</p>
-                <p className="text-xs text-slate-500 truncate">
-                  {categoryName(config, e.categoryId)}
-                  {e.checkedIn ? <span className="text-teal-700 font-semibold"> · Checked in</span> : ''}
-                </p>
-              </div>
-              <QrCode value={entryQrPayload(e.number)} size={40} className="shrink-0 rounded border border-slate-200" />
-              <button onClick={() => onPrintTag(e)} aria-label={`Print tag for entry ${e.number}`} className="shrink-0 p-2 text-slate-400 hover:text-slate-700">
-                <Printer size={15} />
-              </button>
-            </div>
-          ))}
+          {found.map((e) => <MyEntryRow key={e.id} config={config} entry={e} onPrintTag={onPrintTag} />)}
         </div>
       </div>
+    </div>
+  );
+}
+
+/* The same list as a page of its own, reachable from the registration form.
+   A registrant who arrived on a direct link has no home page to go back to,
+   so this is where they recover a tag — and it is the only route back to the
+   form from here. */
+function MyEntriesView({ config, entries, onPrintTag, onRegister }) {
+  const [cleared, setCleared] = useState(false);
+  const found = cleared ? [] : findMyEntries(entries);
+  const clear = () => { forgetMyEntries(); setCleared(true); };
+
+  return (
+    <div className="max-w-md mx-auto px-4 py-8">
+      <div className="flex items-start justify-between gap-2 mb-1">
+        <h2 className="sb-display text-2xl">Your Entries</h2>
+        {found.length > 0 && (
+          <button onClick={clear} className="text-xs text-slate-400 hover:text-slate-600 underline shrink-0 mt-2">
+            Not you? Clear
+          </button>
+        )}
+      </div>
+
+      {found.length === 0 ? (
+        <div className="bg-white border border-slate-200 rounded-xl p-5 mt-4 text-center">
+          <p className="text-slate-600 text-sm mb-1">Nothing registered from this device yet.</p>
+          <p className="text-slate-400 text-xs">
+            Entries are remembered by the device that submitted them. If you registered on a different
+            phone — or someone registered on your behalf — the registration desk can look you up by name
+            and reprint your tag.
+          </p>
+        </div>
+      ) : (
+        <>
+          <p className="text-slate-500 text-sm mb-4">
+            {found.length} model{found.length === 1 ? '' : 's'} registered from this device. Lost your tag?
+            Reprint it here, or ask at the registration desk.
+          </p>
+          <div className="space-y-2">
+            {found.map((e) => <MyEntryRow key={e.id} config={config} entry={e} onPrintTag={onPrintTag} />)}
+          </div>
+        </>
+      )}
+
+      <button
+        onClick={onRegister}
+        className="w-full mt-6 flex items-center justify-center gap-2 bg-amber-500 hover:bg-amber-400 text-slate-900 font-semibold rounded-lg py-2.5"
+      >
+        <UserPlus size={16} /> Register {found.length > 0 ? 'another' : 'an'} entry
+      </button>
     </div>
   );
 }
@@ -1009,7 +1072,13 @@ function SetupWizard({ initial, onSave, onCancel, isEdit }) {
 
 /* ------------------------------- register / desk ------------------------------- */
 
-function RegisterView({ config, onSubmit, onPrintTag, remember = true }) {
+/* onViewMine is omitted entirely on the desk's walk-in form — a walk-in is
+   deliberately not remembered on the desk's device, so there is nothing there
+   to link to. `hasMine` gates the button on the form itself so it never leads
+   to an empty page; the confirmation screen doesn't consult it, because the
+   entry that was just remembered is written to localStorage after the parent
+   last rendered and so wouldn't be counted yet. */
+function RegisterView({ config, onSubmit, onPrintTag, onViewMine, hasMine = false, remember = true }) {
   const firstCat = config.categories[0];
   const [form, setForm] = useState({
     name: '', email: '', phone: '', modelName: '',
@@ -1056,13 +1125,20 @@ function RegisterView({ config, onSubmit, onPrintTag, remember = true }) {
         <p className="text-slate-400 text-xs mb-2">Or ask staff to print it for you and set it beside your model.</p>
         {remember && (
           <p className="text-slate-400 text-xs mb-6">
-            This device will remember your entries — find them again under “Your entries” on the home page. On a
-            different device, the registration desk can look you up and reprint.
+            This device will remember your entries — you can come back to “Your entries” at any time to reprint a
+            tag. On a different device, the registration desk can look you up and reprint.
           </p>
         )}
-        <button onClick={() => setConfirmed(null)} className="text-teal-700 font-medium text-sm">
-          Register another entry
-        </button>
+        <div className="flex flex-col gap-3">
+          <button onClick={() => setConfirmed(null)} className="text-teal-700 font-medium text-sm">
+            Register another entry
+          </button>
+          {onViewMine && remember && (
+            <button onClick={onViewMine} className="text-slate-500 hover:text-slate-700 font-medium text-sm underline">
+              View my entries
+            </button>
+          )}
+        </div>
       </div>
     );
   }
@@ -1115,6 +1191,20 @@ function RegisterView({ config, onSubmit, onPrintTag, remember = true }) {
       <button disabled={!canSubmit || saving} className="w-full bg-amber-500 disabled:opacity-40 hover:bg-amber-400 text-slate-900 font-semibold rounded-lg py-2.5 flex items-center justify-center gap-2">
         {saving ? <Loader2 size={16} className="animate-spin" /> : null} Submit entry
       </button>
+      {onViewMine && hasMine && (
+        <div className="pt-2 border-t border-slate-200">
+          <button
+            type="button"
+            onClick={onViewMine}
+            className="w-full flex items-center justify-center gap-2 bg-white border border-slate-300 hover:border-slate-400 text-slate-700 font-semibold rounded-lg py-2.5"
+          >
+            <ListChecks size={16} /> View my entries
+          </button>
+          <p className="text-xs text-slate-400 text-center mt-1.5">
+            Models you've already registered from this device — reprint a tag here.
+          </p>
+        </div>
+      )}
     </form>
   );
 }
@@ -2526,7 +2616,13 @@ function PrintLayer({ job, config, entries, groupRecords }) {
 
 /* ------------------------------------ app ------------------------------------ */
 
-const VALID_VIEWS = ['register', 'desk', 'judge', 'organizer', 'results'];
+const VALID_VIEWS = ['register', 'myentries', 'desk', 'judge', 'organizer', 'results'];
+
+/* Views a registrant reaches on their own, with no staff role behind them.
+   Landing on one of these directly keeps the Home button hidden for the
+   session, so the printed sign's QR code doesn't hand out a route to the
+   staff cards. */
+const REGISTRANT_VIEWS = ['register', 'myentries'];
 
 function getViewFromUrl() {
   try {
@@ -2538,7 +2634,7 @@ function getViewFromUrl() {
 }
 
 function viewTitle(v) {
-  return { register: 'Register', desk: 'Registration Desk', judge: 'Judging', organizer: 'Organizer Console', results: 'Results' }[v] || '';
+  return { register: 'Register', myentries: 'Your Entries', desk: 'Registration Desk', judge: 'Judging', organizer: 'Organizer Console', results: 'Results' }[v] || '';
 }
 
 export default function App() {
@@ -2547,12 +2643,13 @@ export default function App() {
   const [groupRecords, setGroupRecords] = useState({});
   const [loading, setLoading] = useState(true);
   const [view, setView] = useState(getViewFromUrl);
-  // Landed directly on the registration form — from the printed sign's QR
-  // code or a shared link — rather than tapping through from the home page.
-  // Read once at mount, before nav() can rewrite the query string, so the
-  // Home button stays hidden for the whole session. A deterrent, not a lock:
-  // the address bar is still the address bar.
-  const [registrantOnly] = useState(() => getViewFromUrl() === 'register');
+  // Landed directly on a registrant view — from the printed sign's QR code or
+  // a shared link — rather than tapping through from the home page. Read once
+  // at mount, before nav() can rewrite the query string, so the Home button
+  // stays hidden for the whole session even as they move between the form and
+  // their entries. A deterrent, not a lock: the address bar is still the
+  // address bar.
+  const [registrantOnly] = useState(() => REGISTRANT_VIEWS.includes(getViewFromUrl()));
   const [unlocked, setUnlocked] = useState({ desk: false, judge: false, organizer: false });
   const [toast, setToast] = useState(null);
   const [printJob, setPrintJob] = useState(null);
@@ -2816,7 +2913,23 @@ export default function App() {
           <TopBar title={viewTitle(view)} onBack={registrantOnly ? null : () => nav('landing')} />
         )}
         {view === 'landing' && <Landing config={config} entries={entries} onNav={nav} onPrintTag={(entry) => printTags([entry])} />}
-        {view === 'register' && <RegisterView config={config} onSubmit={(form) => addEntry(form, false)} onPrintTag={(entry) => printTags([entry])} />}
+        {view === 'register' && (
+          <RegisterView
+            config={config}
+            onSubmit={(form) => addEntry(form, false)}
+            onPrintTag={(entry) => printTags([entry])}
+            onViewMine={() => nav('myentries')}
+            hasMine={findMyEntries(entries).length > 0}
+          />
+        )}
+        {view === 'myentries' && (
+          <MyEntriesView
+            config={config}
+            entries={entries}
+            onPrintTag={(entry) => printTags([entry])}
+            onRegister={() => nav('register')}
+          />
+        )}
         {view === 'desk' && (
           <PinGate config={config} unlocked={unlocked.desk} onUnlock={() => setUnlocked((u) => ({ ...u, desk: true }))} label="Registration Desk">
             <DeskView config={config} entries={entries} onCheckIn={checkIn} onWalkIn={(form) => addEntry(form, true)} onPrintTags={printTags} notify={notify} />
