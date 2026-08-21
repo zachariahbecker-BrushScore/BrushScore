@@ -479,12 +479,19 @@ function Toast({ message, type }) {
   );
 }
 
+/* onBack is optional. Omitting it drops the Home button and keeps the title
+   centered with a spacer, so a registrant who landed straight on the
+   registration form has no in-app route to the staff role cards. */
 function TopBar({ title, onBack }) {
   return (
     <div className="sticky top-0 z-40 bg-slate-900 text-white px-4 py-3 flex items-center justify-between">
-      <button onClick={onBack} className="flex items-center gap-1.5 text-slate-300 hover:text-white text-sm">
-        <ArrowLeft size={16} /> Home
-      </button>
+      {onBack ? (
+        <button onClick={onBack} className="flex items-center gap-1.5 text-slate-300 hover:text-white text-sm">
+          <ArrowLeft size={16} /> Home
+        </button>
+      ) : (
+        <span className="w-9 shrink-0" aria-hidden="true" />
+      )}
       <h2 className="sb-display text-sm tracking-wide">{title}</h2>
       <img src={brushscoreIcon} alt="" className="w-9 h-auto shrink-0" />
     </div>
@@ -2540,6 +2547,12 @@ export default function App() {
   const [groupRecords, setGroupRecords] = useState({});
   const [loading, setLoading] = useState(true);
   const [view, setView] = useState(getViewFromUrl);
+  // Landed directly on the registration form — from the printed sign's QR
+  // code or a shared link — rather than tapping through from the home page.
+  // Read once at mount, before nav() can rewrite the query string, so the
+  // Home button stays hidden for the whole session. A deterrent, not a lock:
+  // the address bar is still the address bar.
+  const [registrantOnly] = useState(() => getViewFromUrl() === 'register');
   const [unlocked, setUnlocked] = useState({ desk: false, judge: false, organizer: false });
   const [toast, setToast] = useState(null);
   const [printJob, setPrintJob] = useState(null);
@@ -2799,7 +2812,9 @@ export default function App() {
     <>
       <GlobalStyles />
       <div className="min-h-screen bg-slate-50 sb-root no-print">
-        {view !== 'landing' && <TopBar title={viewTitle(view)} onBack={() => nav('landing')} />}
+        {view !== 'landing' && (
+          <TopBar title={viewTitle(view)} onBack={registrantOnly ? null : () => nav('landing')} />
+        )}
         {view === 'landing' && <Landing config={config} entries={entries} onNav={nav} onPrintTag={(entry) => printTags([entry])} />}
         {view === 'register' && <RegisterView config={config} onSubmit={(form) => addEntry(form, false)} onPrintTag={(entry) => printTags([entry])} />}
         {view === 'desk' && (
