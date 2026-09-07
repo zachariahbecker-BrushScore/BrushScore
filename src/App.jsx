@@ -227,11 +227,29 @@ function seatForJudge(config, number) {
   return idx < 0 ? null : idx + 1;
 }
 
-/* Which judges may vote on an award. Category awards go to the team covering
-   the award's category; named awards to every rostered judge; show awards to
-   nobody. A category no team has claimed is open to every judge, matching the
-   existing rule that an unassigned category is judged by any team rather than
-   silently by none. */
+// The lowest-numbered judge on a team. Derived from the roster rather than
+// designated in Settings, so there is no second place for it to disagree
+// with — but it does mean the role moves if the organizer renumbers a team.
+function firstJudgeOfTeam(config, teamId) {
+  return judgesForTeam(config, teamId)[0] || null;
+}
+
+/* Who answers for an award.
+
+   Category awards are a single pick, not a vote: the first judge on the team
+   covering that category chooses on the team's behalf. That is deliberate.
+   Where a team judged one exhibitor's several pieces as a collection, every
+   piece appears separately in the award list, and three judges who all agree
+   that exhibitor deserves best-in-category could each name a different piece
+   of it and split their own vote three ways. One picker cannot split.
+
+   Named awards stay a vote of every rostered judge — they cut across
+   categories and no team owns them. Show awards go to nobody.
+
+   A category no team has claimed falls to the first judge of every team,
+   keeping the existing rule that an unassigned category belongs to all teams
+   rather than silently to none. That is the one case where a category award
+   is a genuine tally. */
 function votersForAward(award, config) {
   const roster = rosterOf(config).filter((j) => j.teamId);
   const scope = voteScopeFor(award);
@@ -240,8 +258,11 @@ function votersForAward(award, config) {
   const catId = categoryIdForAward(award, config);
   if (!catId) return [];
   const team = teamForCategory(config, catId);
-  if (!team) return roster;
-  return roster.filter((j) => j.teamId === team.id);
+  if (!team) {
+    return (config.teams || []).map((t) => firstJudgeOfTeam(config, t.id)).filter(Boolean);
+  }
+  const first = firstJudgeOfTeam(config, team.id);
+  return first ? [first] : [];
 }
 
 const ABSTAIN = 'abstain';
@@ -261,8 +282,8 @@ function tallyAward(award, config, votes, entries) {
     if (v) { voted += 1; counts.set(v, (counts.get(v) || 0) + 1); }
   });
   const ranked = Array.from(counts.entries())
-    .map(([id, count]) => ({ entry: entries.find((e) => e.id === id) || null, count }))
-    .filter((r) => r.entry)
+    .map(([value, count]) => ({ value, target: describeAwardTarget(value, entries, config), count }))
+    .filter((r) => r.target)
     .sort((a, b) => b.count - a.count);
   const top = ranked[0]?.count || 0;
   const leaders = top > 0 ? ranked.filter((r) => r.count === top) : [];
@@ -311,6 +332,82 @@ function buildAwards(entries, groupRecords, config) {
   const byEntry = new Map();
   rows.forEach((row) => row.medalled.forEach((e) => byEntry.set(e.id, row)));
   return { rows, byEntry };
+}
+
+/* --------------------- special awards: entries and collections ---------------
+
+   A special award normally names one entry, and `config.specialAwards` holds
+   entry ids. A category award may also name a whole collection: where a team
+   judged one exhibitor's several pieces together and the group took Gold, the
+   work stands as a body and can be named best in category as a body.
+
+   Those are stored as `group:<groupKey>` so the two kinds live in the same
+   field without a schema change. Everything that reads a special award goes
+   through describeAwardTarget, which resolves either form to the pieces it
+   covers — a value whose group or entry has since been deleted resolves to
+   null and is skipped rather than rendering as a blank line.
+
+   Only Gold, and only collections. A representative award already names the
+   one piece the team chose, and a bronze or silver collection has not been
+   judged to a standard that carries a best-in-category. Named and show awards
+   take entries only: they are subject awards, and a subject is a piece. */
+const GROUP_AWARD_PREFIX = 'group:';
+
+function isGroupAwardValue(v) {
+  return typeof v === 'string' && v.startsWith(GROUP_AWARD_PREFIX);
+}
+
+function goldCollectionRows(entries, groupRecords, config) {
+  return buildAwards(entries, groupRecords, config).rows.filter(
+    (r) => r.result.scope === 'collection' && r.result.finalMedal?.key === 'gold'
+  );
+}
+
+// The choices for one award: its eligible entries, plus any gold collection
+// in the same category when the award is a category award.
+function awardOptions(award, entries, config, collections, showAll) {
+  const opts = (showAll ? entries : eligibleEntries(award, entries, config))
+    .slice()
+    .sort((a, b) => a.number - b.number)
+    .map((e) => ({ value: e.id, label: `#${pad(e.number)} ${e.modelName} (${e.name})`, exhibitor: e.name }));
+  if (award.group !== 'cat') return opts;
+  const catId = categoryIdForAward(award, config);
+  const groups = (collections || [])
+    .filter((r) => showAll || (catId && r.group.categoryId === catId))
+    .map((r) => ({
+      value: `${GROUP_AWARD_PREFIX}${r.group.key}`,
+      label: `${r.group.name} — entire collection, ${r.group.entries.length} pieces (Gold)`,
+      exhibitor: r.group.name,
+    }));
+  // Collections lead the list: a gold body of work is the strongest thing in
+  // the category, and burying it under its own pieces invites picking one of
+  // them by accident.
+  return [...groups, ...opts];
+}
+
+function describeAwardTarget(value, entries, config) {
+  if (!value) return null;
+  if (isGroupAwardValue(value)) {
+    const key = value.slice(GROUP_AWARD_PREFIX.length);
+    const g = buildGroups(entries).find((x) => x.key === key);
+    if (!g) return null;
+    return {
+      kind: 'collection',
+      exhibitor: g.name,
+      pieces: g.entries,
+      label: `${g.name} — entire collection, ${g.entries.length} pieces`,
+      categoryId: g.categoryId,
+    };
+  }
+  const e = entries.find((x) => x.id === value);
+  if (!e) return null;
+  return {
+    kind: 'entry',
+    exhibitor: e.name,
+    pieces: [e],
+    label: `#${pad(e.number)} ${e.modelName} — ${e.name}`,
+    categoryId: e.categoryId,
+  };
 }
 
 /* How a group's award should be described wherever it is announced or
@@ -1867,11 +1964,12 @@ function GroupCard({ group, config, record, teamId, seat, judgeNumber, judgeName
    say so; without it the organizer cannot tell a split panel from an absent
    one, and the turnout figure means nothing.
 --------------------------------------------------------------------------- */
-function BallotRow({ award, config, entries, judgeName, myVote, onVote }) {
-  const pool = eligibleEntries(award, entries, config)
-    .filter((e) => !isOwnWork(judgeName, e.name))
-    .sort((a, b) => a.number - b.number);
-  const chosen = myVote && myVote !== ABSTAIN ? entries.find((e) => e.id === myVote) : null;
+function BallotRow({ award, config, entries, collections, judgeName, myVote, onVote, scopeNotes }) {
+  const pool = awardOptions(award, entries, config, collections, false)
+    .filter((o) => !isOwnWork(judgeName, o.exhibitor));
+  const chosen = myVote && myVote !== ABSTAIN
+    ? pool.find((o) => o.value === myVote) || null
+    : null;
 
   return (
     <div className="border-b border-slate-100 py-2.5">
@@ -1892,11 +1990,15 @@ function BallotRow({ award, config, entries, judgeName, myVote, onVote }) {
         <div className="flex items-center gap-2">
           <select
             className={`sb-input text-sm flex-1 ${chosen ? 'border-teal-400' : ''}`}
-            value={chosen?.id || ''}
+            value={chosen?.value || ''}
             onChange={(e) => onVote(award.id, e.target.value || null)}
           >
             <option value="">— choose an entry —</option>
-            {pool.map((e) => <option key={e.id} value={e.id}>#{pad(e.number)} {e.modelName} ({e.name})</option>)}
+            {pool.map((o) => (
+              <option key={o.value} value={o.value}>
+                {o.label}{scopeNotes?.get(o.value) ? ` — ${scopeNotes.get(o.value)}` : ''}
+              </option>
+            ))}
           </select>
           <button onClick={() => onVote(award.id, ABSTAIN)} className="text-xs font-medium text-slate-500 hover:text-slate-700 shrink-0 px-2">
             Abstain
@@ -1905,18 +2007,41 @@ function BallotRow({ award, config, entries, judgeName, myVote, onVote }) {
       )}
       {pool.length === 0 && (
         <p className="text-xs text-slate-400 mt-1">
-          No entries to choose from — either nothing was registered in this category, or the only entry is your own.
+          Nothing to choose from — either nothing was registered in this category, or the only entry is your own.
         </p>
       )}
     </div>
   );
 }
 
-function SpecialAwardsBallot({ config, entries, votes, judgeNumber, judgeName, onSetVote }) {
+function SpecialAwardsBallot({ config, entries, groupRecords, votes, judgeNumber, judgeName, onSetVote }) {
   const mine = SPECIAL_AWARDS.filter(
     (a) => isVotableAward(a) && votersForAward(a, config).some((j) => j.number === judgeNumber)
   );
   const answered = mine.filter((a) => (votes || {})[a.id]?.[judgeNumber]).length;
+
+  /* What the team decided about each entry, so the picker can see that four
+     figures in the list are one exhibitor's collection rather than four
+     unrelated pieces. Labels only — the pool is unchanged, and a piece the
+     team passed over can still take a special award. */
+  const scopeNotes = useMemo(() => {
+    const notes = new Map();
+    buildGroups(entries).forEach((g) => {
+      if (g.entries.length < 2) return;
+      const r = computeGroup(groupRecords[g.key], judgeCountForGroup(config, g.categoryId), g.entries.map((e) => e.id));
+      g.entries.forEach((e) => {
+        if (r.scope === 'collection') notes.set(e.id, `one of a collection of ${g.entries.length}`);
+        else if (r.scope === 'representative' && r.repEntryId === e.id) notes.set(e.id, `team’s pick of ${g.entries.length}`);
+        else if (r.scope === 'representative' && r.repEntryId) notes.set(e.id, 'not the team’s pick');
+      });
+    });
+    return notes;
+  }, [entries, groupRecords, config]);
+
+  const collections = useMemo(
+    () => goldCollectionRows(entries, groupRecords, config),
+    [entries, groupRecords, config]
+  );
 
   if (mine.length === 0) {
     return (
@@ -1930,8 +2055,8 @@ function SpecialAwardsBallot({ config, entries, votes, judgeNumber, judgeName, o
   return (
     <div>
       <p className="text-xs text-slate-500 mb-3">
-        {answered} of {mine.length} answered. One vote each; the panel's counts go to the organizer, who confirms
-        the recipient. Show awards and the Capital Palette awards aren't voted here — the organizer assigns those.
+        {answered} of {mine.length} answered. Your answers go to the organizer, who confirms the recipients. Show
+        awards and the Capital Palette awards aren't decided here — the organizer assigns those.
       </p>
       {AWARD_GROUPS.map((g) => {
         const list = mine.filter((a) => a.group === g.key);
@@ -1941,7 +2066,7 @@ function SpecialAwardsBallot({ config, entries, votes, judgeNumber, judgeName, o
             <h4 className="text-xs font-semibold uppercase tracking-wide text-slate-500 mb-0.5">{g.title}</h4>
             <p className="text-xs text-slate-400 mb-2">
               {g.key === 'cat'
-                ? 'Your team\u2019s categories only.'
+                ? 'You are the first judge on your team, so you choose these on the team’s behalf — one pick each, not a vote.'
                 : 'Open to every judge — any entry, regardless of category.'}
             </p>
             {list.map((a) => (
@@ -1950,9 +2075,11 @@ function SpecialAwardsBallot({ config, entries, votes, judgeNumber, judgeName, o
                 award={a}
                 config={config}
                 entries={entries}
+                collections={collections}
                 judgeName={judgeName}
                 myVote={(votes || {})[a.id]?.[judgeNumber]}
                 onVote={(awardId, value) => onSetVote(awardId, judgeNumber, value)}
+                scopeNotes={scopeNotes}
               />
             ))}
           </div>
@@ -2072,6 +2199,7 @@ function JudgeView({ config, entries, groupRecords, votes, onSetScope, onSetMark
         <SpecialAwardsBallot
           config={config}
           entries={entries}
+          groupRecords={groupRecords}
           votes={votes}
           judgeNumber={judgeNumber}
           judgeName={judgeName}
@@ -2326,6 +2454,9 @@ function MedalSummary({ config, entries, groupRecords }) {
 function VoteTally({ tally, current, onAssign, multi }) {
   const { ranked, leaders, tied, voters, voted, abstained, pending } = tally;
   const top = ranked[0]?.count || 0;
+  // A category award has a single picker — the first judge on the owning team
+  // — so counting votes on it would read as a broken tally. Say what it is.
+  const single = voters.length === 1;
 
   if (voters.length === 0) {
     return (
@@ -2339,28 +2470,36 @@ function VoteTally({ tally, current, onAssign, multi }) {
   return (
     <div className="bg-slate-50 border border-slate-200 rounded p-2 mb-1.5">
       <div className="flex items-center justify-between gap-2 mb-1">
-        <span className="text-xs font-semibold text-slate-500">Judges' vote</span>
+        <span className="text-xs font-semibold text-slate-500">
+          {single ? `Judge ${voters[0].number}${voters[0].name ? ` · ${voters[0].name}` : ''} picked for the team` : "Judges' vote"}
+        </span>
         <span className="sb-mono text-[10px] text-slate-500">
-          {voted}/{voters.length} in{abstained ? ` · ${abstained} abstained` : ''}{pending ? ` · ${pending} pending` : ''}
+          {single
+            ? (abstained ? 'abstained' : pending ? 'not yet answered' : 'answered')
+            : `${voted}/${voters.length} in${abstained ? ` · ${abstained} abstained` : ''}${pending ? ` · ${pending} pending` : ''}`}
         </span>
       </div>
       {ranked.length === 0 ? (
-        <p className="text-xs text-slate-400">No votes cast yet.</p>
+        <p className="text-xs text-slate-400">{single ? 'No pick made yet.' : 'No votes cast yet.'}</p>
       ) : (
         <div className="space-y-1">
           {ranked.slice(0, 4).map((r) => {
             const isLeader = r.count === top;
             return (
-              <div key={r.entry.id} className="flex items-center gap-2">
+              <div key={r.value} className="flex items-center gap-2">
                 <span className={`text-xs truncate flex-1 ${isLeader ? 'text-slate-900 font-medium' : 'text-slate-500'}`}>
-                  <EntryBadgeInline number={r.entry.number} />{r.entry.modelName}
+                  {r.target.kind === 'collection'
+                    ? r.target.label
+                    : <><EntryBadgeInline number={r.target.pieces[0].number} />{r.target.pieces[0].modelName}</>}
                 </span>
-                <span className="sb-mono text-[10px] text-slate-500 shrink-0">
-                  {r.count} vote{r.count === 1 ? '' : 's'}
-                </span>
-                {isLeader && !multi && current !== r.entry.id && (
+                {!single && (
+                  <span className="sb-mono text-[10px] text-slate-500 shrink-0">
+                    {r.count} vote{r.count === 1 ? '' : 's'}
+                  </span>
+                )}
+                {isLeader && !multi && current !== r.value && (
                   <button
-                    onClick={() => onAssign(r.entry.id)}
+                    onClick={() => onAssign(r.value)}
                     className="text-[10px] font-semibold text-teal-700 border border-teal-200 rounded px-1.5 py-0.5 shrink-0 hover:bg-teal-50"
                   >
                     Use
@@ -2373,11 +2512,11 @@ function VoteTally({ tally, current, onAssign, multi }) {
       )}
       {tied && (
         <p className="text-xs text-amber-800 mt-1.5">
-          Tied on {top} vote{top === 1 ? '' : 's'} — {leaders.map((l) => `#${pad(l.entry.number)}`).join(' and ')}. Pick
-          the recipient below, or ask the Awards Committee Chairman to.
+          Tied on {top} vote{top === 1 ? '' : 's'} — {leaders.map((l) => l.target.exhibitor).join(' and ')}. Pick the
+          recipient below, or ask the Awards Committee Chairman to.
         </p>
       )}
-      {pending > 0 && (
+      {pending > 0 && !single && (
         <p className="text-xs text-slate-400 mt-1">
           {pending} judge{pending === 1 ? '' : 's'} yet to answer — the count can still change.
         </p>
@@ -2386,15 +2525,15 @@ function VoteTally({ tally, current, onAssign, multi }) {
   );
 }
 
-function AwardRow({ award, config, entries, votes, onAssign }) {
+function AwardRow({ award, config, entries, collections, votes, onAssign }) {
   const [showAll, setShowAll] = useState(false);
-  const pool = showAll ? entries : eligibleEntries(award, entries, config);
+  const pool = awardOptions(award, entries, config, collections, showAll);
   const current = config.specialAwards?.[award.id];
   const tally = isVotableAward(award) ? tallyAward(award, config, votes, entries) : null;
 
   if (award.multi) {
     const list = Array.isArray(current) ? current : [];
-    const remaining = pool.filter((e) => !list.includes(e.id));
+    const remaining = pool.filter((o) => !list.includes(o.value));
     return (
       <div className="border-b border-slate-100 py-2.5">
         <p className="text-sm font-semibold text-slate-800">
@@ -2406,11 +2545,11 @@ function AwardRow({ award, config, entries, votes, onAssign }) {
         <div className="flex flex-wrap gap-1.5 mt-1.5 mb-1.5">
           {list.length === 0 && <span className="text-xs text-slate-400">None yet</span>}
           {list.map((id) => {
-            const e = entries.find((x) => x.id === id);
-            if (!e) return null;
+            const t = describeAwardTarget(id, entries, config);
+            if (!t) return null;
             return (
               <span key={id} className="text-xs bg-slate-100 border border-slate-200 rounded px-1.5 py-0.5 flex items-center gap-1">
-                #{pad(e.number)} {e.modelName}
+                {t.label}
                 <button onClick={() => onAssign(award.id, list.filter((x) => x !== id))} aria-label="Remove" className="text-red-500 font-bold px-0.5">
                   <Minus size={11} />
                 </button>
@@ -2425,7 +2564,7 @@ function AwardRow({ award, config, entries, votes, onAssign }) {
             onChange={(e) => { if (e.target.value) onAssign(award.id, [...list, e.target.value]); }}
           >
             <option value="">Add an entry…</option>
-            {remaining.map((e) => <option key={e.id} value={e.id}>#{pad(e.number)} {e.modelName}</option>)}
+            {remaining.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
           </select>
           <label className="text-xs text-slate-400 flex items-center gap-1 shrink-0">
             <input type="checkbox" checked={showAll} onChange={(e) => setShowAll(e.target.checked)} /> All entries
@@ -2449,7 +2588,7 @@ function AwardRow({ award, config, entries, votes, onAssign }) {
           onChange={(e) => onAssign(award.id, e.target.value || null)}
         >
           <option value="">— not assigned —</option>
-          {pool.map((e) => <option key={e.id} value={e.id}>#{pad(e.number)} {e.modelName} ({e.name})</option>)}
+          {pool.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
         </select>
         <label className="text-xs text-slate-400 flex items-center gap-1 shrink-0">
           <input type="checkbox" checked={showAll} onChange={(e) => setShowAll(e.target.checked)} /> All entries
@@ -2460,6 +2599,10 @@ function AwardRow({ award, config, entries, votes, onAssign }) {
 }
 
 function AwardsTab({ config, entries, groupRecords, votes, onAssign }) {
+  const collections = useMemo(
+    () => goldCollectionRows(entries, groupRecords, config),
+    [entries, groupRecords, config]
+  );
   return (
     <div>
       <h3 className="font-semibold text-slate-800 text-sm mb-2">Medal results</h3>
@@ -2488,7 +2631,7 @@ function AwardsTab({ config, entries, groupRecords, votes, onAssign }) {
             <h4 className="text-xs font-semibold uppercase tracking-wide text-slate-500 mb-0.5">{g.title}</h4>
             <p className="text-xs text-slate-400 mb-2">{g.note}</p>
             {SPECIAL_AWARDS.filter((a) => a.group === g.key).map((a) => (
-              <AwardRow key={a.id} award={a} config={config} entries={entries} votes={votes} onAssign={onAssign} />
+              <AwardRow key={a.id} award={a} config={config} entries={entries} collections={collections} votes={votes} onAssign={onAssign} />
             ))}
           </div>
         ))}
@@ -2741,7 +2884,7 @@ function ResultsView({ config, entries, groupRecords }) {
   const namedResults = SPECIAL_AWARDS.map((a) => {
     const val = config.specialAwards?.[a.id];
     const ids = Array.isArray(val) ? val : val ? [val] : [];
-    const winners = ids.map((id) => entries.find((e) => e.id === id)).filter(Boolean);
+    const winners = ids.map((id) => describeAwardTarget(id, entries, config)).filter(Boolean);
     return { a, winners };
   }).filter((x) => x.winners.length > 0);
 
@@ -2756,11 +2899,11 @@ function ResultsView({ config, entries, groupRecords }) {
         <p className="text-slate-500 text-sm">Results</p>
       </div>
 
-      {bestOfShow && bestOfShow.winners.map((e) => (
-        <div key={e.id} className="bg-slate-900 text-white rounded-xl p-6 text-center mb-8">
+      {bestOfShow && bestOfShow.winners.map((t, i) => (
+        <div key={i} className="bg-slate-900 text-white rounded-xl p-6 text-center mb-8">
           <p className="text-amber-400 text-xs uppercase tracking-widest font-semibold mb-2">Judges Best of Show</p>
-          <p className="sb-display text-2xl">{e.modelName}</p>
-          <p className="text-slate-300 text-sm mt-1">{e.name} · #{pad(e.number)}</p>
+          <p className="sb-display text-2xl">{t.pieces[0]?.modelName}</p>
+          <p className="text-slate-300 text-sm mt-1">{t.exhibitor} · #{pad(t.pieces[0]?.number)}</p>
         </div>
       ))}
 
@@ -2821,11 +2964,22 @@ function ResultsView({ config, entries, groupRecords }) {
               <div key={a.id} className="text-sm">
                 <span className="font-semibold text-amber-700">{a.name}</span>
                 {a.useShowTheme && <span className="block text-xs text-slate-400">{config.showTheme}</span>}
-                {winners.map((e) => (
-                  <p key={e.id} className="text-slate-700 ml-1">
-                    <EntryBadgeInline number={e.number} /> {e.modelName} — <span className="text-slate-500">{e.name}</span>
+                {winners.map((t, i) => (t.kind === 'collection' ? (
+                  <div key={i} className="ml-1">
+                    <p className="text-slate-700">
+                      {t.exhibitor} — <span className="text-teal-700 text-xs font-medium">entire collection, {t.pieces.length} pieces</span>
+                    </p>
+                    {t.pieces.map((e) => (
+                      <p key={e.id} className="text-xs text-slate-500 ml-2">
+                        <EntryBadgeInline number={e.number} /> {e.modelName}
+                      </p>
+                    ))}
+                  </div>
+                ) : (
+                  <p key={i} className="text-slate-700 ml-1">
+                    <EntryBadgeInline number={t.pieces[0].number} /> {t.pieces[0].modelName} — <span className="text-slate-500">{t.exhibitor}</span>
                   </p>
-                ))}
+                )))}
               </div>
             ))}
           </div>
@@ -2965,14 +3119,22 @@ function ResultsSheet({ config, entries, groupRecords }) {
           {SPECIAL_AWARDS.map((a) => {
             const val = config.specialAwards?.[a.id];
             const ids = Array.isArray(val) ? val : val ? [val] : [];
-            const names = ids.map((id) => {
-              const e = entries.find((x) => x.id === id);
-              return e ? `#${pad(e.number)} ${e.modelName} — ${e.name}` : null;
-            }).filter(Boolean);
+            const targets = ids.map((id) => describeAwardTarget(id, entries, config)).filter(Boolean);
             return (
               <tr key={a.id}>
                 <td>{a.name}{a.useShowTheme ? <><br /><em style={{ fontSize: '8pt' }}>{config.showTheme}</em></> : null}</td>
-                <td>{names.length ? names.map((n, i) => <div key={i}>{n}</div>) : '—'}</td>
+                <td>
+                  {targets.length === 0 ? '—' : targets.map((t, i) => (t.kind === 'collection' ? (
+                    <div key={i}>
+                      <div>{t.exhibitor} — <em style={{ fontSize: '8.5pt' }}>entire collection, {t.pieces.length} pieces</em></div>
+                      {t.pieces.map((e) => (
+                        <div key={e.id} style={{ fontSize: '9pt', paddingLeft: '12pt' }}>#{pad(e.number)} {e.modelName}</div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div key={i}>#{pad(t.pieces[0].number)} {t.pieces[0].modelName} — {t.exhibitor}</div>
+                  )))}
+                </td>
               </tr>
             );
           })}
