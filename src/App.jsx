@@ -294,6 +294,74 @@ function parseEntryQr(text) {
   return m ? parseInt(m[1], 10) : null;
 }
 
+/* ---------------------------- scanner gun support ----------------------------
+
+   A handheld scanner — the Tera, and every Zebra/Honeywell/Symcode like it —
+   does not present itself to the browser as a camera. There is no device to
+   open, no permission to grant, and nothing for the Scan button to point at.
+   It is a keyboard: it types the payload as a fast burst of keystrokes and
+   finishes with Enter, into whichever element happens to have focus.
+
+   So there is nothing to select and no button to press. This listens to the
+   whole document instead, collects printable keys, and on Enter asks whether
+   what accumulated was a BrushScore payload.
+
+   Deciding by payload shape rather than by typing speed is deliberate. Speed
+   heuristics misfire in both directions — a quick typist trips them, a gun on
+   a busy USB hub slips under them — whereas `BrushScore-ENTRY-047` is not a
+   string anyone types into a desk terminal by accident. Timing is used only
+   to discard a stale buffer, never to decide what counts as a scan.
+
+   Anything that is not a BrushScore payload is passed through untouched, so
+   ordinary typing in the search box behaves exactly as it did before. */
+
+/* Gap after which the keys collected so far are assumed to be someone typing
+   rather than part of a burst. A gun fires characters roughly 10–20ms apart;
+   a fast human is nearer 90ms and single-finger desk typing is slower still.
+   The threshold only decides when to forget a partial buffer, so being
+   generous here costs nothing. */
+const WEDGE_IDLE_MS = 150;
+
+function useWedgeScanner(onScan, active = true) {
+  // Kept in a ref so the listener is registered once and still calls the
+  // current handler. Re-attaching on every entries change would rebuild the
+  // buffer mid-scan and drop the tag being read at that moment.
+  const handlerRef = useRef(onScan);
+  useEffect(() => { handlerRef.current = onScan; }, [onScan]);
+
+  useEffect(() => {
+    if (!active) return undefined;
+    let buffer = '';
+    let last = 0;
+
+    const onKeyDown = (ev) => {
+      // A modifier means a real shortcut, not a gun. (Shift alone arrives as
+      // its own keydown ahead of each capital and is ignored below.)
+      if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
+
+      const now = Date.now();
+      if (now - last > WEDGE_IDLE_MS) buffer = '';
+      last = now;
+
+      // Enter is the usual suffix; some guns ship configured for Tab.
+      if (ev.key === 'Enter' || ev.key === 'Tab') {
+        const text = buffer;
+        buffer = '';
+        if (parseEntryQr(text) == null) return;
+        // Only now is it certain this was a scan — swallow the terminator so
+        // it can't submit a form or move focus on the way out.
+        ev.preventDefault();
+        handlerRef.current(text);
+        return;
+      }
+      if (ev.key.length === 1) buffer += ev.key;
+    };
+
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [active]);
+}
+
 function loadScriptOnce(src) {
   return new Promise((resolve, reject) => {
     if (window.jsQR) { resolve(); return; }
@@ -710,43 +778,16 @@ function RoleCard({ icon: Icon, title, desc, onClick, accent }) {
   );
 }
 
-/* Resolve the remembered id/number pairs against the live entry list.
-   Matches on id, then falls back to the entry number — an entry deleted and
-   re-added by the desk keeps its number but not its id. Anything that
-   resolves to nothing (deleted outright) simply drops off the list. */
-function findMyEntries(entries) {
-  return readMyEntries()
+function MyEntriesPanel({ config, entries, onPrintTag }) {
+  const [mine, setMine] = useState(readMyEntries);
+  // Match on id, then fall back to the entry number — an entry deleted and
+  // re-added by the desk keeps its number but not its id.
+  const found = mine
     .map((m) => entries.find((e) => e.id === m.id) || entries.find((e) => e.number === m.number))
     .filter(Boolean);
-}
-
-/* One remembered entry. Shared by the home-page panel and the standalone
-   page so the two can't drift apart. */
-function MyEntryRow({ config, entry, onPrintTag }) {
-  return (
-    <div className="flex items-center gap-3 border border-slate-100 rounded-lg p-2.5">
-      <EntryBadge number={entry.number} size="sm" />
-      <div className="flex-1 min-w-0">
-        <p className="font-medium text-slate-900 truncate text-sm">{entry.modelName}</p>
-        <p className="text-xs text-slate-500 truncate">
-          {categoryName(config, entry.categoryId)}
-          {entry.checkedIn ? <span className="text-teal-700 font-semibold"> · Checked in</span> : ''}
-        </p>
-      </div>
-      <QrCode value={entryQrPayload(entry.number)} size={40} className="shrink-0 rounded border border-slate-200" />
-      <button onClick={() => onPrintTag(entry)} aria-label={`Print tag for entry ${entry.number}`} className="shrink-0 p-2 text-slate-400 hover:text-slate-700">
-        <Printer size={15} />
-      </button>
-    </div>
-  );
-}
-
-function MyEntriesPanel({ config, entries, onPrintTag }) {
-  const [cleared, setCleared] = useState(false);
-  const found = cleared ? [] : findMyEntries(entries);
   if (found.length === 0) return null;
 
-  const clear = () => { forgetMyEntries(); setCleared(true); };
+  const clear = () => { forgetMyEntries(); setMine([]); };
 
   return (
     <div className="max-w-3xl mx-auto px-4 pb-6">
@@ -761,60 +802,24 @@ function MyEntriesPanel({ config, entries, onPrintTag }) {
           Registered from this device. Lost your tag? Reprint it here, or ask at the registration desk.
         </p>
         <div className="space-y-2">
-          {found.map((e) => <MyEntryRow key={e.id} config={config} entry={e} onPrintTag={onPrintTag} />)}
+          {found.map((e) => (
+            <div key={e.id} className="flex items-center gap-3 border border-slate-100 rounded-lg p-2.5">
+              <EntryBadge number={e.number} size="sm" />
+              <div className="flex-1 min-w-0">
+                <p className="font-medium text-slate-900 truncate text-sm">{e.modelName}</p>
+                <p className="text-xs text-slate-500 truncate">
+                  {categoryName(config, e.categoryId)}
+                  {e.checkedIn ? <span className="text-teal-700 font-semibold"> · Checked in</span> : ''}
+                </p>
+              </div>
+              <QrCode value={entryQrPayload(e.number)} size={40} className="shrink-0 rounded border border-slate-200" />
+              <button onClick={() => onPrintTag(e)} aria-label={`Print tag for entry ${e.number}`} className="shrink-0 p-2 text-slate-400 hover:text-slate-700">
+                <Printer size={15} />
+              </button>
+            </div>
+          ))}
         </div>
       </div>
-    </div>
-  );
-}
-
-/* The same list as a page of its own, reachable from the registration form.
-   A registrant who arrived on a direct link has no home page to go back to,
-   so this is where they recover a tag — and it is the only route back to the
-   form from here. */
-function MyEntriesView({ config, entries, onPrintTag, onRegister }) {
-  const [cleared, setCleared] = useState(false);
-  const found = cleared ? [] : findMyEntries(entries);
-  const clear = () => { forgetMyEntries(); setCleared(true); };
-
-  return (
-    <div className="max-w-md mx-auto px-4 py-8">
-      <div className="flex items-start justify-between gap-2 mb-1">
-        <h2 className="sb-display text-2xl">Your Entries</h2>
-        {found.length > 0 && (
-          <button onClick={clear} className="text-xs text-slate-400 hover:text-slate-600 underline shrink-0 mt-2">
-            Not you? Clear
-          </button>
-        )}
-      </div>
-
-      {found.length === 0 ? (
-        <div className="bg-white border border-slate-200 rounded-xl p-5 mt-4 text-center">
-          <p className="text-slate-600 text-sm mb-1">Nothing registered from this device yet.</p>
-          <p className="text-slate-400 text-xs">
-            Entries are remembered by the device that submitted them. If you registered on a different
-            phone — or someone registered on your behalf — the registration desk can look you up by name
-            and reprint your tag.
-          </p>
-        </div>
-      ) : (
-        <>
-          <p className="text-slate-500 text-sm mb-4">
-            {found.length} model{found.length === 1 ? '' : 's'} registered from this device. Lost your tag?
-            Reprint it here, or ask at the registration desk.
-          </p>
-          <div className="space-y-2">
-            {found.map((e) => <MyEntryRow key={e.id} config={config} entry={e} onPrintTag={onPrintTag} />)}
-          </div>
-        </>
-      )}
-
-      <button
-        onClick={onRegister}
-        className="w-full mt-6 flex items-center justify-center gap-2 bg-amber-500 hover:bg-amber-400 text-slate-900 font-semibold rounded-lg py-2.5"
-      >
-        <UserPlus size={16} /> Register {found.length > 0 ? 'another' : 'an'} entry
-      </button>
     </div>
   );
 }
@@ -1072,13 +1077,7 @@ function SetupWizard({ initial, onSave, onCancel, isEdit }) {
 
 /* ------------------------------- register / desk ------------------------------- */
 
-/* onViewMine is omitted entirely on the desk's walk-in form — a walk-in is
-   deliberately not remembered on the desk's device, so there is nothing there
-   to link to. `hasMine` gates the button on the form itself so it never leads
-   to an empty page; the confirmation screen doesn't consult it, because the
-   entry that was just remembered is written to localStorage after the parent
-   last rendered and so wouldn't be counted yet. */
-function RegisterView({ config, onSubmit, onPrintTag, onViewMine, hasMine = false, remember = true }) {
+function RegisterView({ config, onSubmit, onPrintTag, remember = true }) {
   const firstCat = config.categories[0];
   const [form, setForm] = useState({
     name: '', email: '', phone: '', modelName: '',
@@ -1125,20 +1124,13 @@ function RegisterView({ config, onSubmit, onPrintTag, onViewMine, hasMine = fals
         <p className="text-slate-400 text-xs mb-2">Or ask staff to print it for you and set it beside your model.</p>
         {remember && (
           <p className="text-slate-400 text-xs mb-6">
-            This device will remember your entries — you can come back to “Your entries” at any time to reprint a
-            tag. On a different device, the registration desk can look you up and reprint.
+            This device will remember your entries — find them again under “Your entries” on the home page. On a
+            different device, the registration desk can look you up and reprint.
           </p>
         )}
-        <div className="flex flex-col gap-3">
-          <button onClick={() => setConfirmed(null)} className="text-teal-700 font-medium text-sm">
-            Register another entry
-          </button>
-          {onViewMine && remember && (
-            <button onClick={onViewMine} className="text-slate-500 hover:text-slate-700 font-medium text-sm underline">
-              View my entries
-            </button>
-          )}
-        </div>
+        <button onClick={() => setConfirmed(null)} className="text-teal-700 font-medium text-sm">
+          Register another entry
+        </button>
       </div>
     );
   }
@@ -1191,20 +1183,6 @@ function RegisterView({ config, onSubmit, onPrintTag, onViewMine, hasMine = fals
       <button disabled={!canSubmit || saving} className="w-full bg-amber-500 disabled:opacity-40 hover:bg-amber-400 text-slate-900 font-semibold rounded-lg py-2.5 flex items-center justify-center gap-2">
         {saving ? <Loader2 size={16} className="animate-spin" /> : null} Submit entry
       </button>
-      {onViewMine && hasMine && (
-        <div className="pt-2 border-t border-slate-200">
-          <button
-            type="button"
-            onClick={onViewMine}
-            className="w-full flex items-center justify-center gap-2 bg-white border border-slate-300 hover:border-slate-400 text-slate-700 font-semibold rounded-lg py-2.5"
-          >
-            <ListChecks size={16} /> View my entries
-          </button>
-          <p className="text-xs text-slate-400 text-center mt-1.5">
-            Models you've already registered from this device — reprint a tag here.
-          </p>
-        </div>
-      )}
     </form>
   );
 }
@@ -1233,8 +1211,26 @@ function DeskView({ config, entries, onCheckIn, onWalkIn, onPrintTags, notify })
     if (number == null) { notify("That code isn't a BrushScore entry.", 'error'); return; }
     const found = entries.find((e) => e.number === number);
     if (!found) { notify(`No entry found for #${number}.`, 'error'); return; }
+    // Say so rather than checking in twice. Someone working down a stack of
+    // sheets will re-scan one sooner or later, and a second silent "Checked
+    // in." reads as confirmation that this one was new.
+    if (found.checkedIn) { notify(`#${pad(number)} was already checked in.`); return; }
     onCheckIn(found.id, true);
   };
+
+  /* The gun types into whatever holds focus, which at a desk is usually the
+     search box. Nothing can prevent that — the keys are delivered before the
+     payload is recognisable as one — so clear the box afterward instead of
+     leaving the list filtered to nothing by a string no entry can match. */
+  const handleWedge = (text) => {
+    setQ((current) => (current.includes(text.trim()) ? '' : current));
+    handleScan(text);
+  };
+
+  // Off while the walk-in form is open (a scan there would check in a
+  // stranger's entry mid-registration) and while the camera scanner is up
+  // (which would otherwise handle the same tag twice).
+  useWedgeScanner(handleWedge, !showWalkIn && !scanning);
 
   if (showWalkIn) {
     return (
@@ -1266,6 +1262,11 @@ function DeskView({ config, entries, onCheckIn, onWalkIn, onPrintTags, notify })
         <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
         <input className="sb-input pl-9" placeholder="Search name, entry #, or model" value={q} onChange={(e) => setQ(e.target.value)} />
       </div>
+      <p className="text-xs text-slate-400 mb-3">
+        Using a scanner gun? Just shoot the tag — it checks in on its own, wherever you're clicked. The
+        <span className="font-medium text-slate-500"> Scan </span>
+        button above is for this device's camera instead.
+      </p>
       <div className="flex items-center justify-between mb-3">
         <div className="flex gap-3 text-xs">
           <button onClick={() => setSelected(new Set(filtered.map((e) => e.id)))} className="text-teal-700 font-medium">Select all</button>
@@ -2616,13 +2617,7 @@ function PrintLayer({ job, config, entries, groupRecords }) {
 
 /* ------------------------------------ app ------------------------------------ */
 
-const VALID_VIEWS = ['register', 'myentries', 'desk', 'judge', 'organizer', 'results'];
-
-/* Views a registrant reaches on their own, with no staff role behind them.
-   Landing on one of these directly keeps the Home button hidden for the
-   session, so the printed sign's QR code doesn't hand out a route to the
-   staff cards. */
-const REGISTRANT_VIEWS = ['register', 'myentries'];
+const VALID_VIEWS = ['register', 'desk', 'judge', 'organizer', 'results'];
 
 function getViewFromUrl() {
   try {
@@ -2634,7 +2629,7 @@ function getViewFromUrl() {
 }
 
 function viewTitle(v) {
-  return { register: 'Register', myentries: 'Your Entries', desk: 'Registration Desk', judge: 'Judging', organizer: 'Organizer Console', results: 'Results' }[v] || '';
+  return { register: 'Register', desk: 'Registration Desk', judge: 'Judging', organizer: 'Organizer Console', results: 'Results' }[v] || '';
 }
 
 export default function App() {
@@ -2643,13 +2638,12 @@ export default function App() {
   const [groupRecords, setGroupRecords] = useState({});
   const [loading, setLoading] = useState(true);
   const [view, setView] = useState(getViewFromUrl);
-  // Landed directly on a registrant view — from the printed sign's QR code or
-  // a shared link — rather than tapping through from the home page. Read once
-  // at mount, before nav() can rewrite the query string, so the Home button
-  // stays hidden for the whole session even as they move between the form and
-  // their entries. A deterrent, not a lock: the address bar is still the
-  // address bar.
-  const [registrantOnly] = useState(() => REGISTRANT_VIEWS.includes(getViewFromUrl()));
+  // Landed directly on the registration form — from the printed sign's QR
+  // code or a shared link — rather than tapping through from the home page.
+  // Read once at mount, before nav() can rewrite the query string, so the
+  // Home button stays hidden for the whole session. A deterrent, not a lock:
+  // the address bar is still the address bar.
+  const [registrantOnly] = useState(() => getViewFromUrl() === 'register');
   const [unlocked, setUnlocked] = useState({ desk: false, judge: false, organizer: false });
   const [toast, setToast] = useState(null);
   const [printJob, setPrintJob] = useState(null);
@@ -2913,23 +2907,7 @@ export default function App() {
           <TopBar title={viewTitle(view)} onBack={registrantOnly ? null : () => nav('landing')} />
         )}
         {view === 'landing' && <Landing config={config} entries={entries} onNav={nav} onPrintTag={(entry) => printTags([entry])} />}
-        {view === 'register' && (
-          <RegisterView
-            config={config}
-            onSubmit={(form) => addEntry(form, false)}
-            onPrintTag={(entry) => printTags([entry])}
-            onViewMine={() => nav('myentries')}
-            hasMine={findMyEntries(entries).length > 0}
-          />
-        )}
-        {view === 'myentries' && (
-          <MyEntriesView
-            config={config}
-            entries={entries}
-            onPrintTag={(entry) => printTags([entry])}
-            onRegister={() => nav('register')}
-          />
-        )}
+        {view === 'register' && <RegisterView config={config} onSubmit={(form) => addEntry(form, false)} onPrintTag={(entry) => printTags([entry])} />}
         {view === 'desk' && (
           <PinGate config={config} unlocked={unlocked.desk} onUnlock={() => setUnlocked((u) => ({ ...u, desk: true }))} label="Registration Desk">
             <DeskView config={config} entries={entries} onCheckIn={checkIn} onWalkIn={(form) => addEntry(form, true)} onPrintTags={printTags} notify={notify} />
