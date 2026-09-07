@@ -368,7 +368,12 @@ function migrateTeams(c) {
    read; the roster is the only source of a judge's name from here on. */
 function migrateJudges(c, teams) {
   const teamIds = new Set(teams.map((t) => t.id));
-  if (Array.isArray(c.judges) && c.judges.length) {
+  // An array — even an empty one — means this show has already been through
+  // the roster editor, so it is authoritative. Only a missing `judges` field
+  // means "never migrated". Testing `.length` here instead made an emptied
+  // roster silently repopulate from the stale per-team judgeNames on the next
+  // save, which reads as the edit not taking.
+  if (Array.isArray(c.judges)) {
     const seen = new Set();
     return c.judges
       .map((j) => ({
@@ -1008,7 +1013,7 @@ function Landing({ config, entries, onNav, onPrintTag }) {
 
 /* -------------------------------- setup wizard -------------------------------- */
 
-function SetupWizard({ initial, onSave, onCancel, isEdit }) {
+function SetupWizard({ initial, onSave, onCancel, isEdit, onDirtyChange }) {
   const [name, setName] = useState(initial?.name || '');
   const [date, setDate] = useState(initial?.date || '');
   const [location, setLocation] = useState(initial?.location || '');
@@ -1072,6 +1077,35 @@ function SetupWizard({ initial, onSave, onCancel, isEdit }) {
   }));
 
   const canSave = name.trim() && adminPin.trim().length >= 4 && categories.some((c) => c.name.trim());
+
+  /* Nothing here is written until Save is pressed, and the form got long
+     enough with the roster on it that the button fell below the fold — an
+     edit made at the top and then abandoned looked exactly like the app
+     ignoring it. Compare the whole editable state against what we opened
+     with, so the footer can say plainly that something is pending. */
+  const snapshot = JSON.stringify({ name, date, location, adminPin, chairmanName, teams, judges, showTheme, categories });
+  const initialSnapshot = useMemo(
+    () => JSON.stringify({
+      name: initial?.name || '', date: initial?.date || '', location: initial?.location || '',
+      adminPin: initial?.adminPin || '', chairmanName: initial?.chairmanName || '',
+      teams: initial?.teams?.length
+        ? initial.teams.map((t) => ({ ...t, judgeNames: [...(t.judgeNames || ['', '', ''])] }))
+        : [{ id: teams[0]?.id, name: 'Team A', judgeCount: 3, judgeNames: ['', '', ''], categoryIds: [] }],
+      judges: initial?.judges?.length ? initial.judges.map((j) => ({ ...j })) : judges,
+      showTheme: initial?.showTheme ?? DEFAULT_SHOW_THEME,
+      categories: initial?.categories?.length ? initial.categories : categories,
+    }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [initial]
+  );
+  const dirty = snapshot !== initialSnapshot;
+
+  // Let the Organizer Console warn before a tab switch throws these away.
+  // The callback goes through a ref because the parent passes a fresh arrow
+  // on every render, which would otherwise re-run this on every keystroke.
+  const dirtyCb = useRef(onDirtyChange);
+  useEffect(() => { dirtyCb.current = onDirtyChange; }, [onDirtyChange]);
+  useEffect(() => { if (dirtyCb.current) dirtyCb.current(dirty); }, [dirty]);
 
   const submit = async () => {
     setSaving(true);
@@ -1288,16 +1322,30 @@ function SetupWizard({ initial, onSave, onCancel, isEdit }) {
         ))}
       </div>
 
-      <div className="flex gap-3">
-        {onCancel && (
-          <button onClick={onCancel} className="px-4 py-2.5 rounded-lg border border-slate-300 text-slate-700 font-medium">
-            Cancel
-          </button>
+      {/* Sticky, so the only control that commits any of this is on screen
+          wherever you are in the form. */}
+      <div className="sticky bottom-0 -mx-4 px-4 pt-3 pb-4 bg-slate-50/95 backdrop-blur border-t border-slate-200">
+        {dirty && (
+          <p className="text-xs text-amber-700 font-medium mb-2 flex items-center gap-1">
+            <Edit2 size={12} /> Unsaved changes — nothing is stored until you save.
+          </p>
         )}
-        <button disabled={!canSave || saving} onClick={submit} className="flex-1 bg-slate-900 disabled:opacity-40 text-white rounded-lg py-2.5 font-semibold flex items-center justify-center gap-2">
-          {saving ? <Loader2 size={16} className="animate-spin" /> : <Save size={16} />}
-          {isEdit ? 'Save changes' : 'Open registration'}
-        </button>
+        <div className="flex gap-3">
+          {onCancel && (
+            <button onClick={onCancel} className="px-4 py-2.5 rounded-lg border border-slate-300 text-slate-700 font-medium">
+              Cancel
+            </button>
+          )}
+          <button disabled={!canSave || saving} onClick={submit} className="flex-1 bg-slate-900 disabled:opacity-40 text-white rounded-lg py-2.5 font-semibold flex items-center justify-center gap-2">
+            {saving ? <Loader2 size={16} className="animate-spin" /> : <Save size={16} />}
+            {isEdit ? 'Save changes' : 'Open registration'}
+          </button>
+        </div>
+        {!canSave && (
+          <p className="text-xs text-slate-400 mt-2">
+            A show name, a staff PIN of at least four characters, and one category are needed before this can save.
+          </p>
+        )}
       </div>
     </div>
   );
@@ -2597,6 +2645,16 @@ function PrintTab({ onPrintAllTags, onPrintResults, onPrintRules, onPrintSign })
 function OrganizerView({ config, entries, groupRecords, votes, onUpdateConfig, onUpdateEntry, onDeleteEntry, onPublishToggle, onAssignAward, onRule, onPrintAllTags, onPrintResults, onPrintRules, onPrintSign, onSyncCategories, categorySyncing }) {
   const [tab, setTab] = useState('overview');
   const [editingSettings, setEditingSettings] = useState(false);
+  // Switching tabs unmounts the settings form and throws away whatever was
+  // typed into it. Silent data loss is what made a missed Save look like the
+  // app ignoring the edit, so ask first.
+  const settingsDirty = useRef(false);
+  const leaveSettings = (go) => {
+    if (editingSettings && settingsDirty.current
+      && !window.confirm('You have unsaved show settings. Leave without saving?')) return;
+    settingsDirty.current = false;
+    go();
+  };
 
   const tabs = [
     { id: 'overview', label: 'Overview', icon: BarChart3 },
@@ -2614,7 +2672,7 @@ function OrganizerView({ config, entries, groupRecords, votes, onUpdateConfig, o
         {tabs.map((t) => (
           <button
             key={t.id}
-            onClick={() => { setTab(t.id); setEditingSettings(false); }}
+            onClick={() => leaveSettings(() => { setTab(t.id); setEditingSettings(false); })}
             className={`flex items-center gap-1.5 px-3 py-2 text-sm font-medium border-b-2 -mb-px whitespace-nowrap ${tab === t.id ? 'border-amber-500 text-slate-900' : 'border-transparent text-slate-400 hover:text-slate-600'}`}
           >
             <t.icon size={15} /> {t.label}
@@ -2632,8 +2690,9 @@ function OrganizerView({ config, entries, groupRecords, votes, onUpdateConfig, o
           <SetupWizard
             initial={config}
             isEdit
-            onCancel={() => setEditingSettings(false)}
-            onSave={async (cfg) => { await onUpdateConfig(cfg); setEditingSettings(false); }}
+            onDirtyChange={(d) => { settingsDirty.current = d; }}
+            onCancel={() => leaveSettings(() => setEditingSettings(false))}
+            onSave={async (cfg) => { await onUpdateConfig(cfg); settingsDirty.current = false; setEditingSettings(false); }}
           />
         ) : (
           <div className="bg-white border border-slate-200 rounded-lg p-4 space-y-4">
