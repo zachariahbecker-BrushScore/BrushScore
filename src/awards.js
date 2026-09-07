@@ -72,6 +72,47 @@ export const AWARD_GROUPS = [
   { key: 'show', title: 'Show awards', note: 'Announced last.' },
 ];
 
+/* ---------------------------------------------------------------------------
+   Who votes on what
+
+   Category awards are voted on by the judging team that covers the award's
+   category — the team that actually inspected the work. Subject & named
+   awards are open to every judge on the roster, because they cut across
+   categories and no single team owns them. Show awards are not voted at all;
+   the organizer assigns them as before.
+
+   The Capital Palette award takes several recipients, so "most votes wins"
+   has no meaning for it. It stays organizer-assigned alongside the show
+   awards rather than getting a ballot of its own.
+--------------------------------------------------------------------------- */
+export const VOTE_SCOPE = { cat: 'team', named: 'all', show: 'none' };
+
+export const NON_VOTING_AWARD_IDS = ['capital-palette'];
+
+export function voteScopeFor(award) {
+  if (!award || NON_VOTING_AWARD_IDS.includes(award.id)) return 'none';
+  return VOTE_SCOPE[award.group] || 'none';
+}
+
+export function isVotableAward(award) {
+  return voteScopeFor(award) !== 'none';
+}
+
+/* The category id an award filters on, resolved through the show's own
+   category list.
+
+   The link is a name string and has to be: category ids are minted fresh per
+   show (`uid('cat')`), so there is no stable id for this file to reference.
+   That means renaming a category in Settings breaks the link — returns null
+   here — which is why the Organizer's Awards tab checks every category award
+   and names the broken ones rather than letting them fail quietly. This file
+   has been bitten by a silent eligibility failure before; the check is there
+   so it can't happen twice. */
+export function categoryIdForAward(award, config) {
+  if (!award?.filter?.category) return null;
+  return config?.categories?.find((c) => c.name === award.filter.category)?.id || null;
+}
+
 // Entries carry a categoryId, not a category name, so eligibility has to
 // resolve the name through the show's category list. (Earlier versions of
 // this function checked e.categoryName directly — a field nothing ever set,

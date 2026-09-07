@@ -8,10 +8,12 @@ import { encodeQR } from './qrcode';
 import {
   CRITERIA, MEDALS, MARK_GUIDE, MAX_PER_JUDGE, MEDAL_BANDS, medalByKey,
   computeGroup, makeGroupKey, emptyGroup, isOwnWork, flagLabel, fmtPoints,
+  isSupportedPanelSize,
 } from './scoring';
 import {
   DEFAULT_CATEGORIES, DEFAULT_SHOW_THEME,
   SPECIAL_AWARDS, AWARD_GROUPS, eligibleEntries,
+  isVotableAward, voteScopeFor, categoryIdForAward,
 } from './awards';
 import brushscoreLogo from './assets/brushscore-logo.webp';
 import brushscoreIcon from './assets/brushscore-icon-transparent.webp';
@@ -184,6 +186,102 @@ function judgeCountForGroup(config, categoryId) {
   return Number(t?.judgeCount) || Number(config.teams?.[0]?.judgeCount) || 3;
 }
 
+/* ------------------------------ judge roster ------------------------------
+
+   Judges are numbered 1–15 across the whole show and each is assigned to one
+   team: `config.judges = [{ number, name, teamId }]`. The roster is the
+   single source of a judge's identity, which is what makes a special-award
+   vote attributable — "Judge 2" is ambiguous across three teams, "Judge 8"
+   is not.
+
+   Group marks are deliberately NOT re-keyed to these numbers. They stay
+   keyed by seat within the team (`record.marks[1..3]`), exactly as every
+   stored group already has them, and the seat is derived from the judge's
+   position in their team's slice of the roster. So Judge 8 might be seat 2
+   on Team C. Nothing in scoring.js or in any saved group record has to
+   change, and a show part-way through judging keeps its marks.
+--------------------------------------------------------------------------- */
+const MAX_JUDGES = 15;
+
+function rosterOf(config) {
+  return Array.isArray(config?.judges) ? config.judges : [];
+}
+
+// Judges on one team, in roster order. This order defines their seats.
+function judgesForTeam(config, teamId) {
+  return rosterOf(config)
+    .filter((j) => j.teamId && j.teamId === teamId)
+    .sort((a, b) => a.number - b.number);
+}
+
+function judgeByNumber(config, number) {
+  return rosterOf(config).find((j) => j.number === Number(number)) || null;
+}
+
+// The seat this judge occupies within their own team — 1-based, which is
+// what group records key their marks by.
+function seatForJudge(config, number) {
+  const j = judgeByNumber(config, number);
+  if (!j || !j.teamId) return null;
+  const idx = judgesForTeam(config, j.teamId).findIndex((x) => x.number === j.number);
+  return idx < 0 ? null : idx + 1;
+}
+
+/* Which judges may vote on an award. Category awards go to the team covering
+   the award's category; named awards to every rostered judge; show awards to
+   nobody. A category no team has claimed is open to every judge, matching the
+   existing rule that an unassigned category is judged by any team rather than
+   silently by none. */
+function votersForAward(award, config) {
+  const roster = rosterOf(config).filter((j) => j.teamId);
+  const scope = voteScopeFor(award);
+  if (scope === 'none') return [];
+  if (scope === 'all') return roster;
+  const catId = categoryIdForAward(award, config);
+  if (!catId) return [];
+  const team = teamForCategory(config, catId);
+  if (!team) return roster;
+  return roster.filter((j) => j.teamId === team.id);
+}
+
+const ABSTAIN = 'abstain';
+
+/* Count the ballot for one award. `voted` includes abstentions — a judge who
+   looked and declined has taken part, and lumping them in with judges who
+   never opened the ballot would make the turnout figure meaningless. */
+function tallyAward(award, config, votes, entries) {
+  const voters = votersForAward(award, config);
+  const cast = (votes || {})[award.id] || {};
+  const counts = new Map();
+  let abstained = 0;
+  let voted = 0;
+  voters.forEach((j) => {
+    const v = cast[j.number];
+    if (v === ABSTAIN) { abstained += 1; voted += 1; return; }
+    if (v) { voted += 1; counts.set(v, (counts.get(v) || 0) + 1); }
+  });
+  const ranked = Array.from(counts.entries())
+    .map(([id, count]) => ({ entry: entries.find((e) => e.id === id) || null, count }))
+    .filter((r) => r.entry)
+    .sort((a, b) => b.count - a.count);
+  const top = ranked[0]?.count || 0;
+  const leaders = top > 0 ? ranked.filter((r) => r.count === top) : [];
+  return {
+    voters, ranked, leaders,
+    tied: leaders.length > 1,
+    leader: leaders.length === 1 ? leaders[0] : null,
+    voted, abstained,
+    pending: Math.max(0, voters.length - voted),
+  };
+}
+
+/* Category awards whose `filter.category` no longer matches any category in
+   the show — the failure mode a rename produces. Surfaced in the Awards tab
+   because an award with no resolvable category silently has no voters. */
+function brokenCategoryAwards(config) {
+  return SPECIAL_AWARDS.filter((a) => a.filter?.category && !categoryIdForAward(a, config));
+}
+
 /* Free-text search used by both the Registration Desk and the Organizer's
    entries list. Email and phone are included so desk staff can find someone
    who only remembers the address they signed up with. */
@@ -262,6 +360,45 @@ function migrateTeams(c) {
   }];
 }
 
+/* A show configured before the roster existed keeps its judges' names in a
+   per-team `judgeNames` array. Those become roster entries here, numbered
+   straight through the teams in order, so Team A's three judges are 1–3 and
+   Team B's are 4–6 — the numbering an organizer would have written on paper
+   anyway. `judgeNames` is left on the team record untouched but is no longer
+   read; the roster is the only source of a judge's name from here on. */
+function migrateJudges(c, teams) {
+  const teamIds = new Set(teams.map((t) => t.id));
+  if (Array.isArray(c.judges) && c.judges.length) {
+    const seen = new Set();
+    return c.judges
+      .map((j) => ({
+        number: Number(j?.number),
+        name: (j?.name || '').trim(),
+        // A team deleted in Settings would otherwise leave judges pointing at
+        // an id that no longer exists, which reads as "assigned" everywhere
+        // while belonging to no panel.
+        teamId: teamIds.has(j?.teamId) ? j.teamId : null,
+      }))
+      .filter((j) => {
+        if (!(j.number >= 1 && j.number <= MAX_JUDGES) || seen.has(j.number)) return false;
+        seen.add(j.number);
+        return true;
+      })
+      .sort((a, b) => a.number - b.number);
+  }
+  const out = [];
+  let n = 1;
+  teams.forEach((t) => {
+    const names = t.judgeNames || [];
+    const size = Number(t.judgeCount) || 3;
+    for (let i = 0; i < size && n <= MAX_JUDGES; i += 1) {
+      out.push({ number: n, name: (names[i] || '').trim(), teamId: t.id });
+      n += 1;
+    }
+  });
+  return out;
+}
+
 function normalizeConfig(c) {
   if (!c) return c;
   // A show configured before the default category list changed keeps
@@ -272,15 +409,25 @@ function normalizeConfig(c) {
   // default names are missing instead of requiring a manual Settings edit.
   const { categories } = mergeDefaultCategories(c.categories);
   const teams = migrateTeams(c);
+  const judges = migrateJudges(c, teams);
   const known = new Set(categories.map((cat) => cat.id));
   return {
     showTheme: DEFAULT_SHOW_THEME, specialAwards: {}, chairmanName: '',
     ...c,
     categories,
+    judges,
     // A category assigned to a team and later deleted would otherwise leave a
     // dangling id that quietly counts as "assigned" and hides the category
     // from every other team.
-    teams: teams.map((t) => ({ ...t, categoryIds: (t.categoryIds || []).filter((id) => known.has(id)) })),
+    teams: teams.map((t) => ({
+      ...t,
+      categoryIds: (t.categoryIds || []).filter((id) => known.has(id)),
+      // Panel size follows the roster rather than being set separately — the
+      // two can't disagree if only one of them is editable. A team with
+      // nobody rostered yet keeps whatever it had, so the medal bands don't
+      // silently rescale while the organizer is still filling the roster in.
+      judgeCount: judges.filter((j) => j.teamId === t.id).length || Number(t.judgeCount) || 3,
+    })),
   };
 }
 
@@ -872,6 +1019,14 @@ function SetupWizard({ initial, onSave, onCancel, isEdit }) {
       ? initial.teams.map((t) => ({ ...t, judgeNames: [...(t.judgeNames || ['', '', ''])] }))
       : [{ id: uid('team'), name: 'Team A', judgeCount: 3, judgeNames: ['', '', ''], categoryIds: [] }]
   ));
+  // The roster, numbered 1–15 across the whole show. normalizeConfig has
+  // already built this from the old per-team judgeNames on first load, so an
+  // existing show arrives here with its judges already numbered.
+  const [judges, setJudges] = useState(() => (
+    initial?.judges?.length
+      ? initial.judges.map((j) => ({ ...j }))
+      : [1, 2, 3].map((n) => ({ number: n, name: '', teamId: initial?.teams?.[0]?.id || null }))
+  ));
   const [showTheme, setShowTheme] = useState(initial?.showTheme ?? DEFAULT_SHOW_THEME);
   const [categories, setCategories] = useState(
     initial?.categories?.length ? initial.categories : DEFAULT_CATEGORIES.map((n) => ({ id: uid('cat'), name: n }))
@@ -888,13 +1043,24 @@ function SetupWizard({ initial, onSave, onCancel, isEdit }) {
     name: `Team ${String.fromCharCode(65 + ts.length)}`,
     judgeCount: 3, judgeNames: ['', '', ''], categoryIds: [],
   }]);
-  const removeTeam = (id) => setTeams((ts) => (ts.length > 1 ? ts.filter((t) => t.id !== id) : ts));
-  const setJudgeName = (id, idx, value) => setTeams((ts) => ts.map((t) => {
-    if (t.id !== id) return t;
-    const names = [...(t.judgeNames || ['', '', ''])];
-    names[idx] = value;
-    return { ...t, judgeNames: names };
-  }));
+  const removeTeam = (id) => setTeams((ts) => {
+    if (ts.length <= 1) return ts;
+    // Judges on the removed team become unassigned rather than vanishing —
+    // their names are worth keeping, and an unassigned judge is visible in
+    // the roster where a silently dropped one would not be.
+    setJudges((js) => js.map((j) => (j.teamId === id ? { ...j, teamId: null } : j)));
+    return ts.filter((t) => t.id !== id);
+  });
+
+  const patchJudge = (number, patch) => setJudges((js) => js.map((j) => (j.number === number ? { ...j, ...patch } : j)));
+  const addJudge = () => setJudges((js) => {
+    if (js.length >= MAX_JUDGES) return js;
+    const used = new Set(js.map((j) => j.number));
+    let next = 1;
+    while (used.has(next)) next += 1;
+    return [...js, { number: next, name: '', teamId: teams[0]?.id || null }].sort((a, b) => a.number - b.number);
+  });
+  const removeJudge = (number) => setJudges((js) => js.filter((j) => j.number !== number));
   // A category belongs to at most one team. Ticking it for a second team
   // moves it rather than duplicating it, so no group is ever owned twice.
   const toggleTeamCategory = (id, catId) => setTeams((ts) => ts.map((t) => {
@@ -919,9 +1085,12 @@ function SetupWizard({ initial, onSave, onCancel, isEdit }) {
       teams: teams.map((t) => ({
         ...t,
         name: (t.name || '').trim() || 'Team',
-        judgeCount: Number(t.judgeCount) === 2 ? 2 : 3,
+        judgeCount: judges.filter((j) => j.teamId === t.id).length || Number(t.judgeCount) || 3,
         judgeNames: (t.judgeNames || []).map((n) => (n || '').trim()),
       })),
+      judges: judges
+        .map((j) => ({ number: Number(j.number), name: (j.name || '').trim(), teamId: j.teamId || null }))
+        .sort((a, b) => a.number - b.number),
       showTheme: showTheme.trim(),
       categories: categories.filter((c) => c.name.trim()).map((c) => ({ ...c, name: c.name.trim() })),
       status: initial?.status || 'open',
@@ -972,25 +1141,18 @@ function SetupWizard({ initial, onSave, onCancel, isEdit }) {
           </button>
         </div>
         <p className="text-xs text-slate-500 mb-3">
-          A team is normally three judges; two is supported as a reduced panel and shifts the medal bands
-          accordingly. Give each judge a name and the app can stop them scoring their own work. Assign each team
-          the categories it covers — a category left unassigned is open to every team.
+          Assign each team the categories it covers — a category left unassigned is open to every team. Panel
+          size comes from the roster below, so a team is as big as the number of judges you put on it.
         </p>
         <div className="space-y-4">
-          {teams.map((t) => (
+          {teams.map((t) => {
+            const onTeam = judges.filter((j) => j.teamId === t.id).sort((a, b) => a.number - b.number);
+            return (
             <div key={t.id} className="border border-slate-200 rounded-lg p-3">
               <div className="flex gap-2 items-end mb-3">
                 <div className="flex-1">
                   <Field label="Team name">
                     <input className="sb-input" value={t.name} onChange={(e) => patchTeam(t.id, { name: e.target.value })} />
-                  </Field>
-                </div>
-                <div className="w-32">
-                  <Field label="Judges">
-                    <select className="sb-input" value={t.judgeCount} onChange={(e) => patchTeam(t.id, { judgeCount: Number(e.target.value) })}>
-                      <option value={3}>3 — standard</option>
-                      <option value={2}>2 — reduced</option>
-                    </select>
                   </Field>
                 </div>
                 {teams.length > 1 && (
@@ -999,19 +1161,27 @@ function SetupWizard({ initial, onSave, onCancel, isEdit }) {
                   </button>
                 )}
               </div>
-              <p className="text-xs font-medium text-slate-500 mb-1">Judges on this team</p>
-              <div className="grid sm:grid-cols-3 gap-2 mb-3">
-                {Array.from({ length: Number(t.judgeCount) }, (_, i) => i).map((i) => (
-                  <input
-                    key={i}
-                    className="sb-input"
-                    placeholder={`Judge ${i + 1} name`}
-                    value={(t.judgeNames || [])[i] || ''}
-                    onChange={(e) => setJudgeName(t.id, i, e.target.value)}
-                  />
-                ))}
-              </div>
               <p className="text-xs font-medium text-slate-500 mb-1">
+                Judges on this team ({onTeam.length})
+              </p>
+              <p className="text-xs text-slate-500 mb-1">
+                {onTeam.length === 0
+                  ? 'None assigned yet — set them in the roster below.'
+                  : onTeam.map((j) => `Judge ${j.number}${j.name ? ` · ${j.name}` : ''}`).join(' · ')}
+              </p>
+              {onTeam.length > 0 && !isSupportedPanelSize(onTeam.length) && (
+                <p className="text-xs text-red-600 mb-3">
+                  The medal bands are only defined for teams of three or two. A team of {onTeam.length} will be
+                  scored against the three-judge bands (max 12) even though it can award more, so move a judge
+                  before judging starts.
+                </p>
+              )}
+              {onTeam.length === 2 && (
+                <p className="text-xs text-amber-700 mb-3">
+                  Reduced panel — this team scores against the two-judge bands (Gold 8, max 8).
+                </p>
+              )}
+              <p className="text-xs font-medium text-slate-500 mb-1 mt-3">
                 Categories ({(t.categoryIds || []).length || 'none — open to all teams'})
               </p>
               <div className="flex flex-wrap gap-1.5">
@@ -1029,8 +1199,66 @@ function SetupWizard({ initial, onSave, onCancel, isEdit }) {
                 })}
               </div>
             </div>
+            );
+          })}
+        </div>
+      </div>
+
+      <div className="border border-slate-200 rounded-lg p-4 bg-white mb-6">
+        <div className="flex items-center justify-between mb-1">
+          <h3 className="font-semibold text-slate-800 text-sm">Judge roster</h3>
+          <button
+            onClick={addJudge}
+            disabled={judges.length >= MAX_JUDGES}
+            className="text-sm flex items-center gap-1 text-teal-700 hover:text-teal-800 disabled:opacity-40 font-medium"
+          >
+            <Plus size={15} /> Add judge
+          </button>
+        </div>
+        <p className="text-xs text-slate-500 mb-3">
+          Judges are numbered once for the whole show, up to {MAX_JUDGES}, and each belongs to one team. The
+          number is how a judge identifies themselves when they sit down, and how their special-award vote is
+          recorded — so it has to be unique across the show, not per team. Naming a judge is what lets the app
+          stop them scoring or voting for their own work.
+        </p>
+        <div className="space-y-2">
+          {judges.map((j) => (
+            <div key={j.number} className="flex gap-2 items-center">
+              <span className="sb-mono text-xs bg-slate-900 text-amber-400 rounded px-2 py-1.5 shrink-0 w-16 text-center">
+                Judge {j.number}
+              </span>
+              <input
+                className="sb-input flex-1"
+                placeholder="Name"
+                value={j.name || ''}
+                onChange={(e) => patchJudge(j.number, { name: e.target.value })}
+              />
+              <select
+                className="sb-input w-40 shrink-0"
+                value={j.teamId || ''}
+                onChange={(e) => patchJudge(j.number, { teamId: e.target.value || null })}
+              >
+                <option value="">— no team —</option>
+                {teams.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
+              </select>
+              <button onClick={() => removeJudge(j.number)} aria-label={`Remove judge ${j.number}`} className="p-2 text-slate-400 hover:text-red-600 shrink-0">
+                <Trash2 size={16} />
+              </button>
+            </div>
           ))}
         </div>
+        {judges.some((j) => !j.teamId) && (
+          <p className="text-xs text-amber-700 mt-2">
+            {judges.filter((j) => !j.teamId).length} judge(s) have no team. They have nothing to judge and no
+            category awards to vote on, though they can still vote on the subject and named awards.
+          </p>
+        )}
+        {judges.some((j) => !(j.name || '').trim()) && (
+          <p className="text-xs text-slate-400 mt-1">
+            Unnamed judges appear as their number alone, and the app can't tell when one is looking at their own
+            work.
+          </p>
+        )}
       </div>
 
       <Field label="Show theme (used for the Show Theme Award)">
@@ -1309,35 +1537,50 @@ function DeskView({ config, entries, onCheckIn, onWalkIn, onPrintTags, notify })
 
 /* ---------------------------------- judging ---------------------------------- */
 
-function JudgeSeatPicker({ config, teamId, seat, onChange }) {
-  const teams = config.teams || [];
-  const team = teams.find((t) => t.id === teamId) || teams[0];
-  const seats = Array.from({ length: Number(team?.judgeCount) || 3 }, (_, i) => i + 1);
-  return (
-    <div className="bg-white border border-slate-200 rounded-lg p-2 mb-4 space-y-2">
-      {teams.length > 1 && (
-        <div className="flex items-center gap-2">
-          <span className="text-xs font-semibold text-slate-500 pl-1 shrink-0">My team</span>
-          <select className="sb-input flex-1" value={team?.id || ''} onChange={(e) => onChange(e.target.value, 1)}>
-            {teams.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
-          </select>
-        </div>
-      )}
-      <div className="flex items-center gap-2 flex-wrap">
-        <span className="text-xs font-semibold text-slate-500 pl-1 shrink-0">I am</span>
-        {seats.map((s) => {
-          const nm = (team?.judgeNames || [])[s - 1];
-          return (
-            <button
-              key={s}
-              onClick={() => onChange(team.id, s)}
-              className={`px-3 py-1.5 rounded-md text-sm font-semibold ${seat === s ? 'bg-slate-900 text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}
-            >
-              Judge {s}{nm ? ` · ${nm}` : ''}
-            </button>
-          );
-        })}
+/* One choice instead of two. With judges numbered across the whole show, the
+   number alone identifies the judge and their team follows from the roster —
+   so there is no way to sit down as the right seat on the wrong team.
+
+   Identity is shown rather than tucked into a picker because it matters more
+   than it used to. A wrong seat on a group overwrites one mark; a wrong
+   identity on the special-award ballot overwrites another judge's whole
+   ballot. */
+function JudgeIdentityPicker({ config, judgeNumber, onChange }) {
+  const roster = rosterOf(config).slice().sort((a, b) => a.number - b.number);
+  const me = judgeByNumber(config, judgeNumber);
+  const team = (config.teams || []).find((t) => t.id === me?.teamId) || null;
+  const seat = seatForJudge(config, judgeNumber);
+
+  if (roster.length === 0) {
+    return (
+      <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 mb-4 text-xs text-amber-900">
+        No judges are on the roster yet. The organizer sets them up in Organizer Console → Settings → Judge roster.
       </div>
+    );
+  }
+
+  return (
+    <div className="bg-white border border-slate-200 rounded-lg p-3 mb-4">
+      <div className="flex items-center gap-2">
+        <span className="text-xs font-semibold text-slate-500 shrink-0">I am</span>
+        <select
+          className="sb-input flex-1"
+          value={me?.number || ''}
+          onChange={(e) => onChange(Number(e.target.value))}
+        >
+          <option value="">— choose your name —</option>
+          {roster.map((j) => (
+            <option key={j.number} value={j.number}>
+              Judge {j.number}{j.name ? ` · ${j.name}` : ''}
+            </option>
+          ))}
+        </select>
+      </div>
+      {me && (
+        <p className="text-xs text-slate-500 mt-1.5">
+          {team ? `${team.name} · seat ${seat} of ${judgesForTeam(config, team.id).length}` : 'No team assigned — nothing to judge, but you can still vote on the subject and named awards.'}
+        </p>
+      )}
     </div>
   );
 }
@@ -1450,7 +1693,7 @@ function ScopeChooser({ group, result, onSetScope }) {
   );
 }
 
-function GroupCard({ group, config, record, teamId, seat, judgeName, onSetScope, onSetMark, categoryLabel, forceOpen }) {
+function GroupCard({ group, config, record, teamId, seat, judgeNumber, judgeName, onSetScope, onSetMark, categoryLabel, forceOpen }) {
   const [open, setOpen] = useState(false);
   useEffect(() => { if (forceOpen) setOpen(true); }, [forceOpen]);
 
@@ -1527,7 +1770,7 @@ function GroupCard({ group, config, record, teamId, seat, judgeName, onSetScope,
           ) : (
             <div className="mt-3">
               <p className="text-xs font-semibold text-slate-500 mb-1.5">
-                Your mark — Judge {seat}{' '}
+                Your mark — Judge {judgeNumber}{' '}
                 <span className="font-normal text-slate-400">(one number, 0–{MAX_PER_JUDGE}, for the whole {result.scope === 'collection' ? 'collection' : 'piece'})</span>
               </p>
               <MarkInput
@@ -1546,7 +1789,9 @@ function GroupCard({ group, config, record, teamId, seat, judgeName, onSetScope,
             <div className="mt-3 pt-3 border-t border-slate-100">
               <p className="text-xs font-semibold text-slate-500 mb-1">All judges</p>
               {result.marks.map((m) => (
-                <p key={m.slot} className="text-xs text-slate-600 sb-mono">Judge {m.slot}: {m.value}</p>
+                <p key={m.slot} className="text-xs text-slate-600 sb-mono">
+                  Judge {judgesForTeam(config, teamId)[m.slot - 1]?.number ?? m.slot}: {m.value}
+                </p>
               ))}
               <p className="text-xs text-slate-500 sb-mono mt-1">Total: {fmtPoints(result.total, result.max)}</p>
             </div>
@@ -1562,31 +1807,136 @@ function GroupCard({ group, config, record, teamId, seat, judgeName, onSetScope,
   );
 }
 
-function JudgeView({ config, entries, groupRecords, onSetScope, onSetMark, notify }) {
+/* ---------------------------- special awards ballot ----------------------------
+
+   One vote per judge per award. Category awards go to the team that covers
+   the category — the judges who actually inspected the work — and the subject
+   and named awards are open to every rostered judge, because they cut across
+   categories and no team owns them.
+
+   Abstain is a first-class answer, not an empty dropdown. Teams see different
+   tables, so a judge who never walked the Gundam category has to be able to
+   say so; without it the organizer cannot tell a split panel from an absent
+   one, and the turnout figure means nothing.
+--------------------------------------------------------------------------- */
+function BallotRow({ award, config, entries, judgeName, myVote, onVote }) {
+  const pool = eligibleEntries(award, entries, config)
+    .filter((e) => !isOwnWork(judgeName, e.name))
+    .sort((a, b) => a.number - b.number);
+  const chosen = myVote && myVote !== ABSTAIN ? entries.find((e) => e.id === myVote) : null;
+
+  return (
+    <div className="border-b border-slate-100 py-2.5">
+      <p className="text-sm font-semibold text-slate-800 mb-1.5">
+        {award.name}
+        {award.useShowTheme && <span className="block text-xs font-normal text-slate-400 mt-0.5">{config.showTheme}</span>}
+      </p>
+      {myVote === ABSTAIN ? (
+        <div className="flex items-center gap-2">
+          <div className="flex-1 text-xs text-slate-500 border border-slate-200 rounded-lg px-3 py-2">
+            Abstained — no vote counted for you on this award.
+          </div>
+          <button onClick={() => onVote(award.id, null)} className="text-xs font-medium text-teal-700 shrink-0 px-2">
+            Undo
+          </button>
+        </div>
+      ) : (
+        <div className="flex items-center gap-2">
+          <select
+            className={`sb-input text-sm flex-1 ${chosen ? 'border-teal-400' : ''}`}
+            value={chosen?.id || ''}
+            onChange={(e) => onVote(award.id, e.target.value || null)}
+          >
+            <option value="">— choose an entry —</option>
+            {pool.map((e) => <option key={e.id} value={e.id}>#{pad(e.number)} {e.modelName} ({e.name})</option>)}
+          </select>
+          <button onClick={() => onVote(award.id, ABSTAIN)} className="text-xs font-medium text-slate-500 hover:text-slate-700 shrink-0 px-2">
+            Abstain
+          </button>
+        </div>
+      )}
+      {pool.length === 0 && (
+        <p className="text-xs text-slate-400 mt-1">
+          No entries to choose from — either nothing was registered in this category, or the only entry is your own.
+        </p>
+      )}
+    </div>
+  );
+}
+
+function SpecialAwardsBallot({ config, entries, votes, judgeNumber, judgeName, onSetVote }) {
+  const mine = SPECIAL_AWARDS.filter(
+    (a) => isVotableAward(a) && votersForAward(a, config).some((j) => j.number === judgeNumber)
+  );
+  const answered = mine.filter((a) => (votes || {})[a.id]?.[judgeNumber]).length;
+
+  if (mine.length === 0) {
+    return (
+      <p className="text-slate-400 text-sm text-center py-10">
+        No special awards are open to you. Category awards go to the team covering that category, so this is what
+        you'd expect if you're not yet assigned to one.
+      </p>
+    );
+  }
+
+  return (
+    <div>
+      <p className="text-xs text-slate-500 mb-3">
+        {answered} of {mine.length} answered. One vote each; the panel's counts go to the organizer, who confirms
+        the recipient. Show awards and the Capital Palette awards aren't voted here — the organizer assigns those.
+      </p>
+      {AWARD_GROUPS.map((g) => {
+        const list = mine.filter((a) => a.group === g.key);
+        if (list.length === 0) return null;
+        return (
+          <div key={g.key} className="mb-6">
+            <h4 className="text-xs font-semibold uppercase tracking-wide text-slate-500 mb-0.5">{g.title}</h4>
+            <p className="text-xs text-slate-400 mb-2">
+              {g.key === 'cat'
+                ? 'Your team\u2019s categories only.'
+                : 'Open to every judge — any entry, regardless of category.'}
+            </p>
+            {list.map((a) => (
+              <BallotRow
+                key={a.id}
+                award={a}
+                config={config}
+                entries={entries}
+                judgeName={judgeName}
+                myVote={(votes || {})[a.id]?.[judgeNumber]}
+                onVote={(awardId, value) => onSetVote(awardId, judgeNumber, value)}
+              />
+            ))}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function JudgeView({ config, entries, groupRecords, votes, onSetScope, onSetMark, onSetVote, notify }) {
   const teams = config.teams || [];
-  const [teamId, setTeamId] = useState(() => {
-    const saved = lsGet('brushscore:teamId');
-    return teams.some((t) => t.id === saved) ? saved : teams[0]?.id;
-  });
-  const [seat, setSeat] = useState(() => {
-    const saved = Number(lsGet('brushscore:judgeSeat'));
-    return saved >= 1 && saved <= 3 ? saved : 1;
+  const [judgeNumber, setJudgeNumber] = useState(() => {
+    const saved = Number(lsGet('brushscore:judgeNumber'));
+    return judgeByNumber(config, saved) ? saved : null;
   });
 
-  const team = teams.find((t) => t.id === teamId) || teams[0];
+  const me = judgeByNumber(config, judgeNumber);
+  const team = teams.find((t) => t.id === me?.teamId) || null;
+  // Seat within the team, which is what group records key their marks by.
+  const seat = seatForJudge(config, judgeNumber) || 1;
 
   useEffect(() => {
-    // A team removed or shrunk in Settings must not leave this device
-    // pointing at a seat that no longer exists.
-    if (!teams.some((t) => t.id === teamId) && teams[0]) setTeamId(teams[0].id);
-    else if (team && seat > Number(team.judgeCount)) setSeat(1);
-    lsSet('brushscore:teamId', String(teamId || ''));
-    lsSet('brushscore:judgeSeat', String(seat));
+    // A judge removed from the roster in Settings must not leave this device
+    // marking as somebody who no longer exists.
+    if (judgeNumber && !judgeByNumber(config, judgeNumber)) setJudgeNumber(null);
+    lsSet('brushscore:judgeNumber', String(judgeNumber || ''));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [teamId, seat, teams.length, team?.judgeCount]);
+  }, [judgeNumber, rosterOf(config).length]);
 
-  const judgeName = (team?.judgeNames || [])[seat - 1] || '';
+  const judgeName = me?.name || '';
 
+  const [tab, setTab] = useState('groups');
   const [categoryId, setCategoryId] = useState('all');
   const [jump, setJump] = useState('');
   const [highlight, setHighlight] = useState(null);
@@ -1644,16 +1994,43 @@ function JudgeView({ config, entries, groupRecords, onSetScope, onSetMark, notif
     <div className="max-w-2xl mx-auto px-4 py-6">
       <h2 className="sb-display text-2xl mb-1">Judging</h2>
       <p className="text-slate-500 text-sm mb-3">
-        {done} of {groups.length} fully marked in this view
+        {tab === 'groups' ? `${done} of ${groups.length} fully marked in this view` : 'Special awards ballot'}
       </p>
 
-      <JudgeSeatPicker
-        config={config}
-        teamId={team?.id}
-        seat={seat}
-        onChange={(tid, s) => { setTeamId(tid); setSeat(s); }}
-      />
+      <JudgeIdentityPicker config={config} judgeNumber={judgeNumber} onChange={setJudgeNumber} />
 
+      {/* Nothing is markable or votable until the app knows who is holding the
+          device. Marks and votes are both keyed to a judge, and guessing at a
+          default would attribute somebody's work to whoever sat here last. */}
+      {!me ? (
+        <p className="text-slate-400 text-sm text-center py-10">
+          Choose your name above to start judging.
+        </p>
+      ) : (
+      <>
+      <div className="flex gap-1 mb-4 border-b border-slate-200">
+        {[{ id: 'groups', label: 'Groups' }, { id: 'awards', label: 'Special awards' }].map((t) => (
+          <button
+            key={t.id}
+            onClick={() => setTab(t.id)}
+            className={`px-3 py-2 text-sm font-medium border-b-2 -mb-px ${tab === t.id ? 'border-amber-500 text-slate-900' : 'border-transparent text-slate-400 hover:text-slate-600'}`}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      {tab === 'awards' ? (
+        <SpecialAwardsBallot
+          config={config}
+          entries={entries}
+          votes={votes}
+          judgeNumber={judgeNumber}
+          judgeName={judgeName}
+          onSetVote={onSetVote}
+        />
+      ) : (
+      <>
       <div className="flex gap-2 mb-4">
         <select className="sb-input flex-1" value={categoryId} onChange={(e) => setCategoryId(e.target.value)}>
           <option value="all">All my categories</option>
@@ -1678,6 +2055,7 @@ function JudgeView({ config, entries, groupRecords, onSetScope, onSetMark, notif
             record={groupRecords[g.key]}
             teamId={team?.id}
             seat={seat}
+            judgeNumber={judgeNumber}
             judgeName={judgeName}
             onSetScope={onSetScope}
             onSetMark={onSetMark}
@@ -1687,6 +2065,10 @@ function JudgeView({ config, entries, groupRecords, onSetScope, onSetMark, notif
         ))}
       </div>
       {scanning && <QrScanner title="Scan entry to judge" onDetect={handleScan} onClose={() => setScanning(false)} />}
+      </>
+      )}
+      </>
+      )}
     </div>
   );
 }
@@ -1889,10 +2271,78 @@ function MedalSummary({ config, entries, groupRecords }) {
   );
 }
 
-function AwardRow({ award, config, entries, onAssign }) {
+/* The panel's count, shown above the assignment control rather than replacing
+   it. The count informs the decision without becoming the decision — the
+   organizer still confirms, which is also where a tie goes, consistent with
+   the Chairman holding the final say on a tied judging team. */
+function VoteTally({ tally, current, onAssign, multi }) {
+  const { ranked, leaders, tied, voters, voted, abstained, pending } = tally;
+  const top = ranked[0]?.count || 0;
+
+  if (voters.length === 0) {
+    return (
+      <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded p-2 mb-1.5">
+        No judges can vote on this award — its category doesn't match anything in your category list, so the link
+        is broken. Check the name in Settings against <code className="sb-mono">src/awards.js</code>.
+      </p>
+    );
+  }
+
+  return (
+    <div className="bg-slate-50 border border-slate-200 rounded p-2 mb-1.5">
+      <div className="flex items-center justify-between gap-2 mb-1">
+        <span className="text-xs font-semibold text-slate-500">Judges' vote</span>
+        <span className="sb-mono text-[10px] text-slate-500">
+          {voted}/{voters.length} in{abstained ? ` · ${abstained} abstained` : ''}{pending ? ` · ${pending} pending` : ''}
+        </span>
+      </div>
+      {ranked.length === 0 ? (
+        <p className="text-xs text-slate-400">No votes cast yet.</p>
+      ) : (
+        <div className="space-y-1">
+          {ranked.slice(0, 4).map((r) => {
+            const isLeader = r.count === top;
+            return (
+              <div key={r.entry.id} className="flex items-center gap-2">
+                <span className={`text-xs truncate flex-1 ${isLeader ? 'text-slate-900 font-medium' : 'text-slate-500'}`}>
+                  <EntryBadgeInline number={r.entry.number} />{r.entry.modelName}
+                </span>
+                <span className="sb-mono text-[10px] text-slate-500 shrink-0">
+                  {r.count} vote{r.count === 1 ? '' : 's'}
+                </span>
+                {isLeader && !multi && current !== r.entry.id && (
+                  <button
+                    onClick={() => onAssign(r.entry.id)}
+                    className="text-[10px] font-semibold text-teal-700 border border-teal-200 rounded px-1.5 py-0.5 shrink-0 hover:bg-teal-50"
+                  >
+                    Use
+                  </button>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+      {tied && (
+        <p className="text-xs text-amber-800 mt-1.5">
+          Tied on {top} vote{top === 1 ? '' : 's'} — {leaders.map((l) => `#${pad(l.entry.number)}`).join(' and ')}. Pick
+          the recipient below, or ask the Awards Committee Chairman to.
+        </p>
+      )}
+      {pending > 0 && (
+        <p className="text-xs text-slate-400 mt-1">
+          {pending} judge{pending === 1 ? '' : 's'} yet to answer — the count can still change.
+        </p>
+      )}
+    </div>
+  );
+}
+
+function AwardRow({ award, config, entries, votes, onAssign }) {
   const [showAll, setShowAll] = useState(false);
   const pool = showAll ? entries : eligibleEntries(award, entries, config);
   const current = config.specialAwards?.[award.id];
+  const tally = isVotableAward(award) ? tallyAward(award, config, votes, entries) : null;
 
   if (award.multi) {
     const list = Array.isArray(current) ? current : [];
@@ -1904,6 +2354,7 @@ function AwardRow({ award, config, entries, onAssign }) {
           {award.useShowTheme && <span className="block text-xs font-normal text-slate-400 mt-0.5">{config.showTheme}</span>}
           <span className="block text-xs font-normal text-teal-600 mt-0.5">Multiple recipients allowed</span>
         </p>
+        {tally && <VoteTally tally={tally} current={current} onAssign={(id) => onAssign(award.id, id)} multi={!!award.multi} />}
         <div className="flex flex-wrap gap-1.5 mt-1.5 mb-1.5">
           {list.length === 0 && <span className="text-xs text-slate-400">None yet</span>}
           {list.map((id) => {
@@ -1942,6 +2393,7 @@ function AwardRow({ award, config, entries, onAssign }) {
         {award.name}
         {award.useShowTheme && <span className="block text-xs font-normal text-slate-400 mt-0.5">{config.showTheme}</span>}
       </p>
+        {tally && <VoteTally tally={tally} current={current} onAssign={(id) => onAssign(award.id, id)} multi={!!award.multi} />}
       <div className="flex items-center gap-2 mt-1.5">
         <select
           className="sb-input text-sm flex-1"
@@ -1959,20 +2411,36 @@ function AwardRow({ award, config, entries, onAssign }) {
   );
 }
 
-function AwardsTab({ config, entries, groupRecords, onAssign }) {
+function AwardsTab({ config, entries, groupRecords, votes, onAssign }) {
   return (
     <div>
       <h3 className="font-semibold text-slate-800 text-sm mb-2">Medal results</h3>
       <MedalSummary config={config} entries={entries} groupRecords={groupRecords} />
       <div className="border-t border-slate-200 pt-4">
         <h3 className="font-semibold text-slate-800 text-sm mb-1">Special awards</h3>
-        <p className="text-xs text-slate-500 mb-3">Assigned by the panel — not computed from scores.</p>
+        <p className="text-xs text-slate-500 mb-3">
+          Judges vote; you confirm. The count is advice, not the decision — the dropdown on each award is still
+          what assigns it.
+        </p>
+        {/* A category award finds its category by name, because category ids
+            are minted per show and this file has no stable id to match on.
+            Renaming a category in Settings therefore breaks the link, and a
+            broken link means the award has no eligible entries AND no voters
+            — both silently. Naming the casualties here is the cheap fix. */}
+        {brokenCategoryAwards(config).length > 0 && (
+          <div className="text-xs text-red-800 bg-red-50 border border-red-200 rounded p-2 mb-3">
+            <strong>{brokenCategoryAwards(config).length} category award(s) can't find their category:</strong>{' '}
+            {brokenCategoryAwards(config).map((a) => a.name).join(', ')}. Nobody can vote on these and their
+            eligible-entry lists are empty. A category was probably renamed in Settings — restore the name to
+            match <code className="sb-mono">src/awards.js</code>.
+          </div>
+        )}
         {AWARD_GROUPS.map((g) => (
           <div key={g.key} className="mb-6">
             <h4 className="text-xs font-semibold uppercase tracking-wide text-slate-500 mb-0.5">{g.title}</h4>
             <p className="text-xs text-slate-400 mb-2">{g.note}</p>
             {SPECIAL_AWARDS.filter((a) => a.group === g.key).map((a) => (
-              <AwardRow key={a.id} award={a} config={config} entries={entries} onAssign={onAssign} />
+              <AwardRow key={a.id} award={a} config={config} entries={entries} votes={votes} onAssign={onAssign} />
             ))}
           </div>
         ))}
@@ -2126,7 +2594,7 @@ function PrintTab({ onPrintAllTags, onPrintResults, onPrintRules, onPrintSign })
   );
 }
 
-function OrganizerView({ config, entries, groupRecords, onUpdateConfig, onUpdateEntry, onDeleteEntry, onPublishToggle, onAssignAward, onRule, onPrintAllTags, onPrintResults, onPrintRules, onPrintSign, onSyncCategories, categorySyncing }) {
+function OrganizerView({ config, entries, groupRecords, votes, onUpdateConfig, onUpdateEntry, onDeleteEntry, onPublishToggle, onAssignAward, onRule, onPrintAllTags, onPrintResults, onPrintRules, onPrintSign, onSyncCategories, categorySyncing }) {
   const [tab, setTab] = useState('overview');
   const [editingSettings, setEditingSettings] = useState(false);
 
@@ -2157,7 +2625,7 @@ function OrganizerView({ config, entries, groupRecords, onUpdateConfig, onUpdate
       {tab === 'overview' && <OverviewTab config={config} entries={entries} groupRecords={groupRecords} onPublishToggle={onPublishToggle} />}
       {tab === 'entries' && <EntriesTab config={config} entries={entries} groupRecords={groupRecords} onUpdateEntry={onUpdateEntry} onDeleteEntry={onDeleteEntry} />}
       {tab === 'judging' && <JudgingTab config={config} entries={entries} groupRecords={groupRecords} onRule={onRule} />}
-      {tab === 'awards' && <AwardsTab config={config} entries={entries} groupRecords={groupRecords} onAssign={onAssignAward} />}
+      {tab === 'awards' && <AwardsTab config={config} entries={entries} groupRecords={groupRecords} votes={votes} onAssign={onAssignAward} />}
       {tab === 'print' && <PrintTab onPrintAllTags={onPrintAllTags} onPrintResults={onPrintResults} onPrintRules={onPrintRules} onPrintSign={onPrintSign} />}
       {tab === 'settings' && (
         editingSettings ? (
@@ -2636,6 +3104,7 @@ export default function App() {
   const [config, setConfig] = useState(null);
   const [entries, setEntries] = useState([]);
   const [groupRecords, setGroupRecords] = useState({});
+  const [votes, setVotes] = useState({});
   const [loading, setLoading] = useState(true);
   const [view, setView] = useState(getViewFromUrl);
   // Landed directly on the registration form — from the printed sign's QR
@@ -2654,11 +3123,13 @@ export default function App() {
     const cfgRaw = await safeGet('brushscore:config', true);
     const entRaw = await safeGet('brushscore:entries', true);
     const grpRaw = await safeGet('brushscore:groups', true);
+    const voteRaw = await safeGet('brushscore:votes', true);
     const rawConfig = cfgRaw ? JSON.parse(cfgRaw) : null;
     const normalized = normalizeConfig(rawConfig);
     setConfig(normalized);
     setEntries((entRaw ? JSON.parse(entRaw) : []).map(normalizeEntry));
     setGroupRecords(grpRaw ? JSON.parse(grpRaw) : {});
+    setVotes(voteRaw ? JSON.parse(voteRaw) : {});
     setLoading(false);
     // If the default category list picked up names the saved show doesn't
     // have yet, normalizeConfig just added them with fresh ids. Persist
@@ -2768,6 +3239,23 @@ export default function App() {
   const setChairmanRuling = async (key, medalKey, note) => {
     await patchGroup(key, { ruling: medalKey, rulingNote: medalKey ? (note || '') : '' });
     notify(medalKey ? `Chairman's ruling recorded: ${medalByKey(medalKey)?.name}.` : 'Ruling cleared.');
+  };
+
+  /* Ballots come in from up to fifteen devices at once, so a vote re-reads
+     the store and patches only its own award/judge cell. Writing a whole
+     snapshot would let two judges voting seconds apart erase each other, the
+     same hazard patchGroup exists to avoid. */
+  const setVote = async (awardId, judgeNumber, value) => {
+    const raw = await safeGet('brushscore:votes', true);
+    const latest = raw ? JSON.parse(raw) : votes;
+    const forAward = { ...(latest[awardId] || {}) };
+    if (value === null || value === undefined) delete forAward[judgeNumber];
+    else forAward[judgeNumber] = value;
+    const next = { ...latest, [awardId]: forAward };
+    setVotes(next);
+    if (!(await writeKey('brushscore:votes', next))) {
+      notify('Not saved — check your connection and redo that vote.', 'error');
+    }
   };
 
   const addEntry = async (form, isWalkIn = false) => {
@@ -2919,8 +3407,10 @@ export default function App() {
               config={config}
               entries={entries}
               groupRecords={groupRecords}
+              votes={votes}
               onSetScope={setGroupScope}
               onSetMark={setGroupMark}
+              onSetVote={setVote}
               notify={notify}
             />
           </PinGate>
@@ -2931,6 +3421,7 @@ export default function App() {
               config={config}
               entries={entries}
               groupRecords={groupRecords}
+              votes={votes}
               onUpdateConfig={(cfg) => saveConfigNow(normalizeConfig(cfg))}
               onUpdateEntry={updateEntry}
               onDeleteEntry={deleteEntry}

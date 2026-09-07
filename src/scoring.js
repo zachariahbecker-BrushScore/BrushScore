@@ -55,6 +55,17 @@ export const MEDAL_BANDS = {
   2: { max: 8, gold: 8, silver: 6, bronze: 1 },
 };
 
+/* Panel sizes the bands are defined for. A judge roster makes it easy to put
+   four or five judges on one team by accident, and `bandsFor` would quietly
+   score them against a maximum of 12 while the team could actually award 16
+   or 20. Settings checks every team against this list and says so rather than
+   letting the fallback happen silently. */
+export const SUPPORTED_PANEL_SIZES = [3, 2];
+
+export function isSupportedPanelSize(judgeCount) {
+  return SUPPORTED_PANEL_SIZES.includes(Number(judgeCount));
+}
+
 export function bandsFor(judgeCount) {
   return MEDAL_BANDS[judgeCount] || MEDAL_BANDS[3];
 }
