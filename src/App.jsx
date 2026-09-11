@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import {
   UserPlus, ClipboardCheck, ListChecks, Settings, Trophy, ArrowLeft,
   Search, Plus, Trash2, Check, Lock, Edit2, Save, Loader2, BarChart3, Users,
-  QrCode as QrCodeIcon, X, Copy, Printer, ChevronDown, ChevronUp, Minus,
+  QrCode as QrCodeIcon, X, Copy, Printer, ChevronDown, ChevronUp, Minus, Download,
 } from 'lucide-react';
 import { encodeQR } from './qrcode';
 import {
@@ -17,6 +17,7 @@ import {
 } from './awards';
 import brushscoreLogo from './assets/brushscore-logo.webp';
 import brushscoreIcon from './assets/brushscore-icon-transparent.webp';
+import ncmssSeal from './assets/ncmss-seal.png';
 
 /* ---------------------------------- data ---------------------------------- */
 
@@ -332,6 +333,144 @@ function buildAwards(entries, groupRecords, config) {
   const byEntry = new Map();
   rows.forEach((row) => row.medalled.forEach((e) => byEntry.set(e.id, row)));
   return { rows, byEntry };
+}
+
+/* ------------------------- awards ceremony program -------------------------
+
+   What gets announced, in what order. deck.js turns this into slides and knows
+   nothing about groups or medals; this is the only place the ceremony order
+   lives. Categories run in the show's own order, each with its medal tiers
+   ascending (Bronze read first, Gold last) and its best-in-category after
+   them. Named awards follow, then Peoples' Choice, and Judges Best of Show
+   closes.
+
+   Empty tiers and unassigned awards are dropped rather than printed as blank
+   slides — an announcer clicking past "Not awarded" six times is worse than
+   the award simply not being in the deck. */
+const MEDAL_TIERS = [
+  { key: 'bronze', label: 'Bronze Medal' },
+  { key: 'silver', label: 'Silver Medal' },
+  { key: 'gold', label: 'Gold Medal' },
+];
+
+function medalItemFor(row) {
+  const g = row.group;
+  const pieces = g.entries.map((e) => `#${pad(e.number)} ${e.modelName}`);
+  if (row.result.scope === 'collection') {
+    return {
+      headline: g.name,
+      sub: `Entire collection · ${g.entries.length} pieces`,
+      subAccent: true,
+      pieces,
+    };
+  }
+  if (row.result.scope === 'representative' && row.rep) {
+    return {
+      headline: row.rep.modelName,
+      sub: `${g.name} · #${pad(row.rep.number)} · representative of ${g.entries.length}`,
+    };
+  }
+  const e = row.medalled[0] || g.entries[0];
+  return { headline: e.modelName, sub: `${g.name} · #${pad(e.number)}` };
+}
+
+function targetItem(t) {
+  if (!t) return null;
+  if (t.kind === 'collection') {
+    return {
+      headline: t.exhibitor,
+      sub: `Entire collection · ${t.pieces.length} pieces`,
+      subAccent: true,
+      pieces: t.pieces.map((e) => `#${pad(e.number)} ${e.modelName}`),
+    };
+  }
+  const e = t.pieces[0];
+  return { headline: e.modelName, sub: `${t.exhibitor} · #${pad(e.number)}` };
+}
+
+function awardSlot(award, config, entries) {
+  const val = config.specialAwards?.[award.id];
+  const ids = Array.isArray(val) ? val : val ? [val] : [];
+  const items = ids.map((id) => targetItem(describeAwardTarget(id, entries, config))).filter(Boolean);
+  if (!items.length) return null;
+  const numbers = ids
+    .map((id) => describeAwardTarget(id, entries, config))
+    .filter(Boolean)
+    .flatMap((t) => t.pieces.map((e) => `#${pad(e.number)}`));
+  return {
+    award: award.name,
+    items,
+    notes: `${award.name}
+Entry ${numbers.join(', ')}`,
+  };
+}
+
+/* The society seal, as a data URL for pptxgenjs. Vite serves it as a file URL
+   rather than inlining it at this size, and pptxgenjs wants bytes, so fetch and
+   convert. Returns null on any failure: a deck with no seal still reads fine,
+   a deck that never builds does not. */
+async function sealDataUrl() {
+  try {
+    const res = await fetch(ncmssSeal);
+    const blob = await res.blob();
+    return await new Promise((resolve, reject) => {
+      const fr = new FileReader();
+      fr.onload = () => resolve(fr.result);
+      fr.onerror = reject;
+      fr.readAsDataURL(blob);
+    });
+  } catch {
+    return null;
+  }
+}
+
+function buildProgram(config, entries, groupRecords) {
+  const { rows } = buildAwards(entries, groupRecords, config);
+
+  const categories = (config.categories || []).map((cat) => {
+    const mine = rows.filter((r) => r.group.categoryId === cat.id && r.medalled.length);
+    if (!mine.length) return null;
+    const tiers = MEDAL_TIERS.map((t) => {
+      const hits = mine
+        .filter((r) => r.result.finalMedal?.key === t.key)
+        .sort((a, b) => b.result.total - a.result.total);
+      if (!hits.length) return null;
+      return {
+        label: t.label,
+        items: hits.map(medalItemFor),
+        notes: `${cat.name} — ${t.label}
+Entry `
+          + hits.flatMap((r) => r.medalled.map((e) => `#${pad(e.number)}`)).join(', '),
+      };
+    }).filter(Boolean);
+    if (!tiers.length) return null;
+    const award = SPECIAL_AWARDS.find((a) => a.filter?.category === cat.name);
+    return {
+      name: cat.name,
+      medalCount: mine.length,
+      tiers,
+      bestInCategory: award ? awardSlot(award, config, entries) : null,
+    };
+  }).filter(Boolean);
+
+  const specials = SPECIAL_AWARDS
+    .filter((a) => a.group === 'named' || a.id === 'peoples-choice')
+    .map((a) => awardSlot(a, config, entries))
+    .filter(Boolean);
+
+  const bos = SPECIAL_AWARDS.find((a) => a.id === 'judges-best-of-show');
+
+  return {
+    show: {
+      name: config.name || '',
+      date: config.date || '',
+      location: config.location || '',
+      generatedAt: new Date().toLocaleString(),
+    },
+    categories,
+    specials,
+    bestOfShow: bos ? awardSlot(bos, config, entries) : null,
+  };
 }
 
 /* --------------------- special awards: entries and collections ---------------
@@ -2756,7 +2895,7 @@ function JudgingTab({ config, entries, groupRecords, onRule }) {
   );
 }
 
-function PrintTab({ onPrintAllTags, onPrintResults, onPrintRules, onPrintSign }) {
+function PrintTab({ onPrintAllTags, onPrintResults, onPrintRules, onPrintSign, onDownloadDeck, deckBusy }) {
   return (
     <div className="space-y-3">
       <p className="text-sm text-slate-500 mb-2">
@@ -2775,6 +2914,24 @@ function PrintTab({ onPrintAllTags, onPrintResults, onPrintRules, onPrintSign })
       <button onClick={onPrintRules} className="w-full flex items-center justify-center gap-2 bg-white border border-slate-300 text-slate-700 rounded-lg py-2.5 font-semibold">
         <Printer size={16} /> Print judging rules
       </button>
+      <div className="border-t border-slate-200 pt-3 mt-1">
+        <button
+          onClick={onDownloadDeck}
+          disabled={deckBusy}
+          className="w-full flex items-center justify-center gap-2 bg-slate-900 disabled:opacity-50 text-white rounded-lg py-2.5 font-semibold"
+        >
+          {deckBusy ? <Loader2 size={16} className="animate-spin" /> : <Download size={16} />}
+          {deckBusy ? 'Building deck…' : 'Download awards deck (.pptx)'}
+        </button>
+        <p className="text-xs text-slate-400 mt-2">
+          A PowerPoint of the whole ceremony in the society's navy and gold, with the N.C.M.S.S. seal on the
+          title slide and a branded band on every slide: each category's Bronze, Silver, and Gold winners on
+          their own slides, then its best in category, then the special awards, with Judges Best of Show last.
+          Categories with no medals are skipped, and entry numbers go into the speaker notes for whoever is
+          reading. It's a snapshot of the results right now, so generate it after judging is settled — branding
+          added by hand is lost if you regenerate.
+        </p>
+      </div>
       <p className="text-xs text-slate-400">
         The registration sign carries a QR straight to this show's registration form — it reads the
         current address itself, so it stays correct even before you've set up a custom domain.
@@ -2785,7 +2942,7 @@ function PrintTab({ onPrintAllTags, onPrintResults, onPrintRules, onPrintSign })
   );
 }
 
-function OrganizerView({ config, entries, groupRecords, votes, onUpdateConfig, onUpdateEntry, onDeleteEntry, onPublishToggle, onAssignAward, onRule, onPrintAllTags, onPrintResults, onPrintRules, onPrintSign, onSyncCategories, categorySyncing }) {
+function OrganizerView({ config, entries, groupRecords, votes, onUpdateConfig, onUpdateEntry, onDeleteEntry, onPublishToggle, onAssignAward, onRule, onPrintAllTags, onPrintResults, onPrintRules, onPrintSign, onDownloadDeck, deckBusy, onSyncCategories, categorySyncing }) {
   const [tab, setTab] = useState('overview');
   const [editingSettings, setEditingSettings] = useState(false);
   // Switching tabs unmounts the settings form and throws away whatever was
@@ -2827,7 +2984,7 @@ function OrganizerView({ config, entries, groupRecords, votes, onUpdateConfig, o
       {tab === 'entries' && <EntriesTab config={config} entries={entries} groupRecords={groupRecords} onUpdateEntry={onUpdateEntry} onDeleteEntry={onDeleteEntry} />}
       {tab === 'judging' && <JudgingTab config={config} entries={entries} groupRecords={groupRecords} onRule={onRule} />}
       {tab === 'awards' && <AwardsTab config={config} entries={entries} groupRecords={groupRecords} votes={votes} onAssign={onAssignAward} />}
-      {tab === 'print' && <PrintTab onPrintAllTags={onPrintAllTags} onPrintResults={onPrintResults} onPrintRules={onPrintRules} onPrintSign={onPrintSign} />}
+      {tab === 'print' && <PrintTab onPrintAllTags={onPrintAllTags} onPrintResults={onPrintResults} onPrintRules={onPrintRules} onPrintSign={onPrintSign} onDownloadDeck={onDownloadDeck} deckBusy={deckBusy} />}
       {tab === 'settings' && (
         editingSettings ? (
           <SetupWizard
@@ -3479,6 +3636,35 @@ export default function App() {
     }
   };
 
+  /* The deck is generated in the browser and downloaded. pptxgenjs is ~2MB, so
+     it is imported only when the button is pressed rather than shipped to
+     every registrant who loads the site. */
+  const [deckBusy, setDeckBusy] = useState(false);
+  const downloadDeck = async () => {
+    setDeckBusy(true);
+    try {
+      const [{ default: PptxGenJS }, { renderDeck }] = await Promise.all([
+        import('pptxgenjs'),
+        import('./deck'),
+      ]);
+      const program = buildProgram(config, entries, groupRecords);
+      if (!program.categories.length && !program.specials.length && !program.bestOfShow) {
+        notify('Nothing to put in a deck yet — no medals or special awards have been recorded.', 'error');
+        return;
+      }
+      const pptx = new PptxGenJS();
+      renderDeck(pptx, program, await sealDataUrl());
+      const stamp = new Date().toISOString().slice(0, 10);
+      const slug = (config.name || 'show').replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '').toLowerCase();
+      await pptx.writeFile({ fileName: `${slug}-awards-${stamp}.pptx` });
+    } catch (e) {
+      console.error(e);
+      notify('Could not build the deck. Check your connection and try again.', 'error');
+    } finally {
+      setDeckBusy(false);
+    }
+  };
+
   const addEntry = async (form, isWalkIn = false) => {
     const cfgRaw = await safeGet('brushscore:config', true);
     const entRaw = await safeGet('brushscore:entries', true);
@@ -3651,6 +3837,8 @@ export default function App() {
               onRule={setChairmanRuling}
               onPrintAllTags={() => printTags(entries)}
               onPrintResults={printResultsSheet}
+              onDownloadDeck={downloadDeck}
+              deckBusy={deckBusy}
               onPrintRules={printRulesSheet}
               onPrintSign={printRegistrationSign}
               onSyncCategories={syncCategories}
