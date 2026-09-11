@@ -1218,7 +1218,8 @@ function Landing({ config, entries, onNav, onPrintTag }) {
   return (
     <div className="sb-blueprint-bg">
       <div className="max-w-3xl mx-auto px-4 py-14 text-center">
-        <img src={brushscoreLogo} alt="BrushScore" className="mx-auto w-52 sm:w-60 mb-8 rounded-md shadow-sm" />
+        <img src={brushscoreLogo} alt="BrushScore" className="mx-auto w-52 sm:w-60 mb-2 rounded-md shadow-sm" />
+        <p className="text-slate-400 text-xs italic mb-8">by Zach Becker</p>
         <p className="sb-mono text-amber-600 text-xs tracking-widest mb-2">ENTRY №{pad(total + 1)} NEXT UP</p>
         <h1 className="sb-display text-4xl md:text-5xl text-slate-900 mb-2">{config.name}</h1>
         <p className="text-slate-600">{config.date}{config.location ? ` · ${config.location}` : ''}</p>
