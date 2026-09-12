@@ -3,7 +3,7 @@ import {
   UserPlus, ClipboardCheck, ListChecks, Settings, Trophy, ArrowLeft,
   Search, Plus, Trash2, Check, Lock, Edit2, Save, Loader2, BarChart3, Users,
   QrCode as QrCodeIcon, X, Copy, Printer, ChevronDown, ChevronUp, Minus, Download,
-  RefreshCw, AlertTriangle,
+  RefreshCw, AlertTriangle, Activity,
 } from 'lucide-react';
 import jsQR from 'jsqr';
 import { encodeQR } from './qrcode';
@@ -109,6 +109,19 @@ function forgetMyEntries() {
 let writesInFlight = 0;
 function hasPendingWrites() { return writesInFlight > 0; }
 
+/* The last write rejection, kept so the toast can name it. "Check your
+   connection" was actively misleading for the failures that had nothing to
+   do with the connection: a row-level security rejection is a 42501 and no
+   amount of reconnecting fixes it. The code goes in the message so the
+   person holding the tablet can read it out. */
+let lastWriteFailure = null;
+function writeFailureCode() {
+  const f = lastWriteFailure;
+  if (!f) return '';
+  const tag = f.code || f.status || (f.message ? String(f.message).slice(0, 40) : '');
+  return tag ? ` (${tag})` : '';
+}
+
 async function writeKey(key, value) {
   const payload = JSON.stringify(value);
   let lastError = null;
@@ -131,14 +144,18 @@ async function writeKey(key, value) {
      is in the error object, so put it somewhere findable rather than
      discarding it. */
   // eslint-disable-next-line no-console
-  console.error('[BrushScore] write failed:', key, {
-    message: lastError?.message,
+  lastWriteFailure = {
+    key,
+    at: Date.now(),
     code: lastError?.code,
+    status: lastError?.status,
+    message: lastError?.message,
     details: lastError?.details,
     hint: lastError?.hint,
     bytes: payload.length,
-    error: lastError,
-  });
+  };
+  // eslint-disable-next-line no-console
+  console.error('[BrushScore] write failed:', key, { ...lastWriteFailure, error: lastError });
   return false;
 }
 
@@ -3225,6 +3242,170 @@ function PrintTab({ onPrintAllTags, onPrintResults, onPrintRules, onPrintSign, o
   );
 }
 
+
+/* ------------------------------- diagnostics -------------------------------
+
+   Every save failure used to arrive as one sentence blaming the connection,
+   and confirming or ruling out the real cause meant a browser console, which
+   is not a thing anyone is opening on a tablet in a hall on show day. This
+   tests each of the four keys the app writes and reports exactly what the
+   database said, in a place the organizer can reach in three taps and read
+   out over the phone.
+
+   The write test is deliberately a no-op in content: it reads a key and
+   writes back the identical bytes, so it exercises the insert/update path
+   and its policies without changing the show. A key with no row yet gets an
+   empty object, which is the same value the app would have created on its
+   own at the first real save.
+--------------------------------------------------------------------------- */
+
+const STORE_KEYS = [
+  { key: 'brushscore:config', label: 'Show settings', empty: '{}' },
+  { key: 'brushscore:entries', label: 'Entries', empty: '[]' },
+  { key: 'brushscore:groups', label: 'Judging marks', empty: '{}' },
+  { key: 'brushscore:votes', label: 'Special-award ballot', empty: '{}' },
+];
+
+function projectRefFromUrl(url) {
+  const m = /^https?:\/\/([^./]+)\./.exec(url || '');
+  return m ? m[1] : null;
+}
+
+function DiagnosticsTab() {
+  const [results, setResults] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  const url = (import.meta.env?.VITE_SUPABASE_URL || '').trim();
+  const anon = (import.meta.env?.VITE_SUPABASE_ANON_KEY || '').trim();
+  const ref = projectRefFromUrl(url);
+
+  const run = async () => {
+    setBusy(true);
+    const out = [];
+    for (const spec of STORE_KEYS) {
+      const row = { ...spec, read: null, write: null, bytes: null, error: null };
+      let current = null;
+      try {
+        const res = await window.storage.get(spec.key, true);
+        current = res ? res.value : null;
+        row.read = 'ok';
+        row.bytes = current ? current.length : 0;
+        if (current === null) row.read = 'missing';
+      } catch (e) {
+        row.read = 'failed';
+        row.error = e?.message || String(e);
+      }
+      if (row.read !== 'failed') {
+        try {
+          // Identical bytes back in, so nothing about the show changes.
+          await window.storage.set(spec.key, current === null ? spec.empty : current, true);
+          row.write = 'ok';
+        } catch (e) {
+          row.write = 'failed';
+          row.error = [e?.code, e?.status, e?.message, e?.hint].filter(Boolean).join(' \u00b7 ') || String(e);
+        }
+      }
+      out.push(row);
+    }
+    setResults(out);
+    setBusy(false);
+  };
+
+  const badge = (state) => {
+    const style = state === 'ok' ? 'bg-teal-50 text-teal-700 border-teal-200'
+      : state === 'missing' ? 'bg-slate-100 text-slate-500 border-slate-300'
+        : 'bg-red-50 text-red-700 border-red-300';
+    return <span className={`text-[10px] font-semibold uppercase px-1.5 py-0.5 rounded border ${style}`}>{state || '\u2014'}</span>;
+  };
+
+  const failing = (results || []).filter((r) => r.write === 'failed' || r.read === 'failed');
+
+  return (
+    <div className="space-y-5">
+      <div>
+        <h3 className="font-semibold text-slate-800 mb-1 text-sm">Where this app is saving</h3>
+        <p className="text-xs text-slate-500 mb-2">
+          A fix applied in the Supabase dashboard only takes effect if the dashboard and this app
+          are the same project. Check that this reference matches the one in your dashboard URL.
+        </p>
+        <div className="bg-white border border-slate-200 rounded-lg p-3 space-y-1 sb-mono text-xs break-all">
+          <p><span className="text-slate-400">project</span> {ref || <span className="text-red-600">not set</span>}</p>
+          <p><span className="text-slate-400">url</span> {url || <span className="text-red-600">VITE_SUPABASE_URL is empty</span>}</p>
+          <p>
+            <span className="text-slate-400">anon key</span>{' '}
+            {anon ? `present, ${anon.length} chars, \u2026${anon.slice(-6)}` : <span className="text-red-600">VITE_SUPABASE_ANON_KEY is empty</span>}
+          </p>
+        </div>
+      </div>
+
+      <div>
+        <div className="flex items-center justify-between mb-1">
+          <h3 className="font-semibold text-slate-800 text-sm">Read and write test</h3>
+          <button
+            onClick={run}
+            disabled={busy}
+            className="text-sm font-semibold px-3 py-1.5 rounded-lg bg-slate-900 text-white disabled:opacity-60 flex items-center gap-1.5"
+          >
+            {busy ? <Loader2 size={14} className="animate-spin" /> : <Activity size={14} />}
+            {busy ? 'Testing' : 'Run test'}
+          </button>
+        </div>
+        <p className="text-xs text-slate-500 mb-3">
+          Safe to run during a live show. Each key is read and then written back unchanged, so this
+          proves whether saving works without altering anything.
+        </p>
+
+        {results && (
+          <div className="space-y-2">
+            {results.map((r) => (
+              <div key={r.key} className="bg-white border border-slate-200 rounded-lg p-3">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="font-medium text-slate-900 text-sm">{r.label}</span>
+                  <span className="sb-mono text-[11px] text-slate-400">{r.key}</span>
+                  <span className="ml-auto flex items-center gap-1.5">
+                    read {badge(r.read)} write {badge(r.write)}
+                  </span>
+                </div>
+                {r.bytes !== null && r.read === 'ok' && (
+                  <p className="text-[11px] text-slate-400 sb-mono mt-1">{r.bytes.toLocaleString()} bytes</p>
+                )}
+                {r.error && <p className="text-xs text-red-700 sb-mono mt-1 break-all">{r.error}</p>}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {results && failing.length === 0 && (
+          <p className="text-sm text-teal-800 bg-teal-50 border border-teal-200 rounded-lg p-3 mt-3">
+            All four keys read and wrote successfully. Saving works against this project, so a
+            failure you are still seeing is coming from somewhere other than the database.
+          </p>
+        )}
+
+        {failing.some((r) => /42501|row-level|policy|permission/i.test(r.error || '')) && (
+          <div className="text-sm text-red-900 bg-red-50 border border-red-300 rounded-lg p-3 mt-3">
+            <p className="font-semibold mb-1">Row-level security is refusing the write.</p>
+            <p>
+              Run <span className="sb-mono">supabase-fix-votes-key.sql</span> in the SQL editor of
+              project <span className="sb-mono">{ref || 'above'}</span> specifically. Running it
+              against a different project has no effect here.
+            </p>
+          </div>
+        )}
+      </div>
+
+      {lastWriteFailure && (
+        <div>
+          <h3 className="font-semibold text-slate-800 mb-1 text-sm">Last save failure on this device</h3>
+          <pre className="bg-slate-900 text-slate-100 rounded-lg p-3 text-[11px] overflow-x-auto sb-mono">
+{JSON.stringify(lastWriteFailure, null, 2)}
+          </pre>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function OrganizerView({ config, entries, groupRecords, votes, onUpdateConfig, onUpdateEntry, onDeleteEntry, onPublishToggle, onAssignAward, onRule, onPrintAllTags, onPrintResults, onPrintRules, onPrintSign, onDownloadDeck, deckBusy, onSyncCategories, categorySyncing, onSyncPause }) {
   const [tab, setTab] = useState('overview');
   const [editingSettings, setEditingSettings] = useState(false);
@@ -3257,6 +3438,7 @@ function OrganizerView({ config, entries, groupRecords, votes, onUpdateConfig, o
     { id: 'awards', label: 'Awards', icon: Trophy },
     { id: 'print', label: 'Print', icon: Printer },
     { id: 'settings', label: 'Settings', icon: Settings },
+    { id: 'diagnostics', label: 'Diagnostics', icon: Activity },
   ];
 
   return (
@@ -3279,6 +3461,7 @@ function OrganizerView({ config, entries, groupRecords, votes, onUpdateConfig, o
       {tab === 'judging' && <JudgingTab config={config} entries={entries} groupRecords={groupRecords} onRule={onRule} />}
       {tab === 'awards' && <AwardsTab config={config} entries={entries} groupRecords={groupRecords} votes={votes} onAssign={onAssignAward} />}
       {tab === 'print' && <PrintTab onPrintAllTags={onPrintAllTags} onPrintResults={onPrintResults} onPrintRules={onPrintRules} onPrintSign={onPrintSign} onDownloadDeck={onDownloadDeck} deckBusy={deckBusy} />}
+      {tab === 'diagnostics' && <DiagnosticsTab />}
       {tab === 'settings' && (
         editingSettings ? (
           <SetupWizard
@@ -3938,7 +4121,7 @@ export default function App() {
     // re-sets state with identical data every twenty seconds.
     appliedRef.current.config = JSON.stringify(cfg);
     if (await writeKey('brushscore:config', cfg)) return true;
-    notify('Not saved — check your connection and redo that change.', 'error');
+    notify(`Not saved${writeFailureCode()} — see Organizer → Diagnostics, then redo that change.`, 'error');
     return false;
   };
 
@@ -3946,7 +4129,7 @@ export default function App() {
     setEntries(list);
     appliedRef.current.entries = JSON.stringify(list);
     if (await writeKey('brushscore:entries', list)) return true;
-    notify('Not saved — check your connection and redo that change.', 'error');
+    notify(`Not saved${writeFailureCode()} — see Organizer → Diagnostics, then redo that change.`, 'error');
     return false;
   };
 
@@ -3992,7 +4175,7 @@ export default function App() {
     setGroupRecords(next);
     appliedRef.current.groups = JSON.stringify(next);
     if (!(await writeKey('brushscore:groups', next))) {
-      notify('Not saved — check your connection and redo that mark.', 'error');
+      notify(`Not saved${writeFailureCode()} — see Organizer → Diagnostics, then redo that mark.`, 'error');
     }
     return next;
   };
@@ -4038,7 +4221,7 @@ export default function App() {
     setVotes(next);
     appliedRef.current.votes = JSON.stringify(next);
     if (!(await writeKey('brushscore:votes', next))) {
-      notify('Not saved — check your connection and redo that vote.', 'error');
+      notify(`Not saved${writeFailureCode()} — see Organizer → Diagnostics, then redo that vote.`, 'error');
     }
   };
 
