@@ -23,7 +23,8 @@ create table if not exists brushscore_kv (
 -- 2. Version history — the safety net
 -- =====================================================================
 --
--- The app keeps the whole show in three rows (config, entries, groups), so
+-- The app keeps the whole show in four rows (config, entries, groups,
+-- votes), so
 -- every save replaces a whole row. That makes a mistake — or a malicious
 -- wipe — a single UPDATE away.
 --
@@ -105,19 +106,19 @@ drop policy if exists "public update" on brushscore_kv;
 create policy "public read" on brushscore_kv
   for select using (true);
 
--- Writes are limited to the three keys the app actually uses. This does not
+-- Writes are limited to the four keys the app actually uses. This does not
 -- stop a determined person editing a real key, but it does stop the table
 -- being filled with junk rows, which is the cheap drive-by attack.
 create policy "public insert" on brushscore_kv
   for insert with check (
-    key in ('brushscore:config', 'brushscore:entries', 'brushscore:groups')
+    key in ('brushscore:config', 'brushscore:entries', 'brushscore:groups', 'brushscore:votes')
   );
 
 create policy "public update" on brushscore_kv
   for update using (
-    key in ('brushscore:config', 'brushscore:entries', 'brushscore:groups')
+    key in ('brushscore:config', 'brushscore:entries', 'brushscore:groups', 'brushscore:votes')
   ) with check (
-    key in ('brushscore:config', 'brushscore:entries', 'brushscore:groups')
+    key in ('brushscore:config', 'brushscore:entries', 'brushscore:groups', 'brushscore:votes')
   );
 
 -- Deliberately NO delete policy on brushscore_kv: rows are only ever

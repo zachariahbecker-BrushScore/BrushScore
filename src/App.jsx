@@ -3,7 +3,9 @@ import {
   UserPlus, ClipboardCheck, ListChecks, Settings, Trophy, ArrowLeft,
   Search, Plus, Trash2, Check, Lock, Edit2, Save, Loader2, BarChart3, Users,
   QrCode as QrCodeIcon, X, Copy, Printer, ChevronDown, ChevronUp, Minus, Download,
+  RefreshCw, AlertTriangle,
 } from 'lucide-react';
+import jsQR from 'jsqr';
 import { encodeQR } from './qrcode';
 import {
   CRITERIA, MEDALS, MARK_GUIDE, MAX_PER_JUDGE, MEDAL_BANDS, medalByKey,
@@ -25,7 +27,27 @@ function uid(prefix = 'id') {
   return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
 function pad(n) { return String(n).padStart(3, '0'); }
-function categoryName(config, id) { return config.categories.find((c) => c.id === id)?.name || '—'; }
+
+/* An entry can end up pointing at a category id the show no longer has: a
+   category deleted in Settings, or one whose id was re-minted before the
+   config write that would have pinned it landed. Nothing about the entry
+   looks wrong — it lists and prints and checks in normally — but it belongs
+   to no category, so it matches no team, and it used to vanish from every
+   judge's queue at once. Everything downstream now has a name for that
+   state rather than an em dash. */
+const UNASSIGNED_CATEGORY_LABEL = 'Unassigned category';
+const STRAY_CATEGORY = '__unassigned__';
+
+function categoryName(config, id) {
+  return config?.categories?.find((c) => c.id === id)?.name || UNASSIGNED_CATEGORY_LABEL;
+}
+function knownCategoryIds(config) {
+  return new Set((config?.categories || []).map((c) => c.id));
+}
+function strayEntries(config, entries) {
+  const known = knownCategoryIds(config);
+  return (entries || []).filter((e) => !known.has(e.categoryId));
+}
 
 /* ------------------------- remembered entries (device) -------------------------
 
@@ -80,17 +102,29 @@ function forgetMyEntries() {
    venue wifi fails once and succeeds immediately after. Retrying silently
    removes almost all of those. If the retry also fails the change really did
    not persist, and the message says so rather than implying it might have. */
+/* How many writes are in the air right now. The background sync reads this
+   before it pulls: a poll that lands between a judge's mark going out and
+   the store acknowledging it would come back with the copy that predates
+   the mark and put it on screen, which reads as the mark being rejected. */
+let writesInFlight = 0;
+function hasPendingWrites() { return writesInFlight > 0; }
+
 async function writeKey(key, value) {
   const payload = JSON.stringify(value);
   let lastError = null;
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      await window.storage.set(key, payload, true);
-      return true;
-    } catch (e) {
-      lastError = e;
-      if (attempt === 0) await new Promise((r) => setTimeout(r, 400));
+  writesInFlight += 1;
+  try {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        await window.storage.set(key, payload, true);
+        return true;
+      } catch (e) {
+        lastError = e;
+        if (attempt === 0) await new Promise((r) => setTimeout(r, 400));
+      }
     }
+  } finally {
+    writesInFlight -= 1;
   }
   /* Both attempts failed. The toast can only say "not saved"; the actual
      cause — an RLS policy rejection, an expired key, a payload too large —
@@ -562,12 +596,34 @@ function awardScopeNote(row) {
 // there. Shared by normalizeConfig (runs automatically on load) and the
 // manual "Restore missing categories" action in Organizer → Settings, so
 // there's exactly one place this logic lives.
+/* Derived from the name rather than random, and this matters more than it
+   looks. These ids are minted on load whenever the default list has moved
+   ahead of the saved show, and the config write that pins them is best
+   effort. With `uid('cat')` a failed write meant the next load minted a
+   different id for the same category, orphaning anything registered under
+   the first one — an entry pointing at a category that no longer exists,
+   invisible to every judging team. Deriving the id from the name makes the
+   re-mint produce the identical id, so the window closes. */
+function defaultCategoryId(name) {
+  const slug = String(name).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+  return `cat_d_${slug || 'unnamed'}`;
+}
+
 function mergeDefaultCategories(categories) {
   const list = categories || [];
   const existingNames = new Set(list.map((cat) => cat.name));
+  const usedIds = new Set(list.map((cat) => cat.id));
   const missing = DEFAULT_CATEGORIES
     .filter((n) => !existingNames.has(n))
-    .map((n) => ({ id: uid('cat'), name: n }));
+    .map((n) => {
+      let id = defaultCategoryId(n);
+      // Two default names slugging to the same string, or a hand-made
+      // category that already took the slug. Vanishingly unlikely, but a
+      // duplicate id would merge two categories into one.
+      while (usedIds.has(id)) id = `${id}_2`;
+      usedIds.add(id);
+      return { id, name: n };
+    });
   return { categories: missing.length ? [...list, ...missing] : list, added: missing.length };
 }
 
@@ -652,17 +708,26 @@ function normalizeConfig(c) {
   const teams = migrateTeams(c);
   const judges = migrateJudges(c, teams);
   const known = new Set(categories.map((cat) => cat.id));
+  const claimedCategoryIds = new Set();
   return {
     showTheme: DEFAULT_SHOW_THEME, specialAwards: {}, chairmanName: '',
     ...c,
     categories,
     judges,
-    // A category assigned to a team and later deleted would otherwise leave a
-    // dangling id that quietly counts as "assigned" and hides the category
-    // from every other team.
+    // Two guards on the same field. A category assigned to a team and later
+    // deleted leaves a dangling id that quietly counts as "assigned" and
+    // hides the category from every other team. And a category claimed by
+    // two teams resolves to whichever appears first in the list, so the
+    // second team silently loses it — the Settings editor already moves a
+    // category rather than copying it, but a show saved by an older build
+    // can still carry the overlap. First team in the list keeps it.
     teams: teams.map((t) => ({
       ...t,
-      categoryIds: (t.categoryIds || []).filter((id) => known.has(id)),
+      categoryIds: (t.categoryIds || []).filter((id) => {
+        if (!known.has(id) || claimedCategoryIds.has(id)) return false;
+        claimedCategoryIds.add(id);
+        return true;
+      }),
       // Panel size follows the roster rather than being set separately — the
       // two can't disagree if only one of them is editable. A team with
       // nobody rostered yet keeps whatever it had, so the medal bands don't
@@ -673,8 +738,6 @@ function normalizeConfig(c) {
 }
 
 /* ---------------------------------- QR codes ---------------------------------- */
-
-const JSQR_SRC = 'https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js';
 
 function entryQrPayload(number) { return `BrushScore-ENTRY-${number}`; }
 function parseEntryQr(text) {
@@ -748,24 +811,6 @@ function useWedgeScanner(onScan, active = true) {
     document.addEventListener('keydown', onKeyDown);
     return () => document.removeEventListener('keydown', onKeyDown);
   }, [active]);
-}
-
-function loadScriptOnce(src) {
-  return new Promise((resolve, reject) => {
-    if (window.jsQR) { resolve(); return; }
-    const existing = document.querySelector(`script[src="${src}"]`);
-    if (existing) {
-      existing.addEventListener('load', () => resolve());
-      existing.addEventListener('error', () => reject(new Error('load-failed')));
-      return;
-    }
-    const s = document.createElement('script');
-    s.src = src;
-    s.async = true;
-    s.onload = () => resolve();
-    s.onerror = () => reject(new Error('load-failed'));
-    document.head.appendChild(s);
-  });
 }
 
 /* Renders a QR code as inline SVG — generated in the browser, no network
@@ -938,18 +983,48 @@ function Toast({ message, type }) {
 /* onBack is optional. Omitting it drops the Home button and keeps the title
    centered with a spacer, so a registrant who landed straight on the
    registration form has no in-app route to the staff role cards. */
-function TopBar({ title, onBack }) {
+/* Rendered from a timestamp rather than from a countdown, and re-rendered on
+   its own clock, so a device that has quietly fallen out of sync says so
+   instead of showing a number frozen at the moment the poll last succeeded. */
+function SyncAge({ at }) {
+  const [, tick] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => tick((n) => n + 1), 15000);
+    return () => clearInterval(id);
+  }, []);
+  if (!at) return <span className="sb-mono">syncing</span>;
+  const secs = Math.max(0, Math.round((Date.now() - at) / 1000));
+  if (secs < 60) return <span className="sb-mono">{secs}s ago</span>;
+  const mins = Math.round(secs / 60);
+  return <span className={`sb-mono ${mins >= 3 ? 'text-amber-300' : ''}`}>{mins}m ago</span>;
+}
+
+function TopBar({ title, onBack, lastSync, syncing, onRefresh }) {
   return (
-    <div className="sticky top-0 z-40 bg-slate-900 text-white px-4 py-3 flex items-center justify-between">
+    <div className="sticky top-0 z-40 bg-slate-900 text-white px-4 py-3 flex items-center justify-between gap-2">
       {onBack ? (
-        <button onClick={onBack} className="flex items-center gap-1.5 text-slate-300 hover:text-white text-sm">
+        <button onClick={onBack} className="flex items-center gap-1.5 text-slate-300 hover:text-white text-sm shrink-0">
           <ArrowLeft size={16} /> Home
         </button>
       ) : (
         <span className="w-9 shrink-0" aria-hidden="true" />
       )}
-      <h2 className="sb-display text-sm tracking-wide">{title}</h2>
-      <img src={brushscoreIcon} alt="" className="w-9 h-auto shrink-0" />
+      <h2 className="sb-display text-sm tracking-wide truncate">{title}</h2>
+      <div className="flex items-center gap-2 shrink-0">
+        {onRefresh && (
+          <button
+            onClick={onRefresh}
+            disabled={syncing}
+            aria-label="Refresh entries and settings from the show"
+            title="Refresh from the show"
+            className="flex items-center gap-1.5 text-xs text-slate-300 hover:text-white disabled:opacity-60 border border-slate-700 hover:border-slate-500 rounded-md px-2 py-1"
+          >
+            <RefreshCw size={13} className={syncing ? 'animate-spin' : ''} />
+            <span className="hidden sm:inline"><SyncAge at={lastSync} /></span>
+          </button>
+        )}
+        <img src={brushscoreIcon} alt="" className="w-9 h-auto shrink-0" />
+      </div>
     </div>
   );
 }
@@ -990,63 +1065,158 @@ function PinGate({ config, unlocked, onUnlock, children, label }) {
   );
 }
 
+/* ------------------------------ camera scanner ------------------------------
+
+   jsQR is bundled with the app rather than fetched from a CDN when the Scan
+   button is pressed. The CDN build failed in exactly the conditions a show
+   runs in — hall wifi behind a captive portal, a phone in Low Data Mode, a
+   content blocker — and because the fetch happened before the camera was
+   opened, a missing script reported itself as a broken camera.
+
+   Three things matter for iPhones in particular. A bare `facingMode:
+   'environment'` lets Safari hand back the ultra-wide lens on a multi-camera
+   phone, and the ultra-wide cannot focus close enough to resolve a tag, so
+   the preview looks perfect and nothing ever decodes; asking for a 1080p
+   stream steers it to the main wide camera. Repeated `getImageData` without
+   `willReadFrequently` pays for a GPU round trip on every frame, which on an
+   older phone in Low Power Mode drops the effective rate to a crawl. And a
+   rejected `play()` promise is not the same as a dead stream on iOS, so it
+   no longer takes the whole scanner down with it.
+--------------------------------------------------------------------------- */
+
+// Long edge the frame is reduced to before decoding. Full sensor resolution
+// costs more per frame than it returns in detections; this keeps a printed
+// tag legible anywhere in frame while leaving headroom on an older phone.
+// How often a device re-reads the shared entry list and show config.
+// Short enough that a walk-in reaches the judging floor before the exhibitor
+// does, long enough to be nothing on a hall wifi shared by thirty tablets.
+const SYNC_INTERVAL_MS = 20000;
+
+const SCAN_MAX_EDGE = 1024;
+const SCAN_INTERVAL_MS = 80;
+// How long a live-looking preview may go without yielding a single decodable
+// frame before the judge is told what to try.
+const SCAN_HINT_AFTER_MS = 7000;
+
+/* The old scanner reported every failure with one sentence, so a blocked
+   permission, a blocked script, and an http:// link were indistinguishable
+   from each other and from a genuinely broken camera. */
+function cameraErrorMessage(e) {
+  const name = e?.name || '';
+  if (name === 'NotAllowedError' || name === 'SecurityError') {
+    return 'Camera access is blocked for this site. Tap “aA” in the address bar → Website Settings → Camera → Allow, then reopen the scanner. Or enter the number manually.';
+  }
+  if (name === 'NotFoundError' || name === 'OverconstrainedError') {
+    return 'No usable camera was found on this device. Enter the number manually instead.';
+  }
+  if (name === 'NotReadableError' || name === 'AbortError') {
+    return 'The camera is already in use by another app or browser tab. Close it and try again, or enter the number manually.';
+  }
+  if (name === 'InsecureContext') {
+    return 'The camera only works over a secure (https) link. Open the show’s https address rather than a plain http or in-app link, or enter the number manually.';
+  }
+  return `Could not start the camera on this device (${name || 'unknown error'}). If you opened this from an email or chat app, try opening it in Safari or Chrome instead. Or enter the number manually.`;
+}
+
 function QrScanner({ onDetect, onClose, title }) {
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
+  const ctxRef = useRef(null);
   const streamRef = useRef(null);
-  const rafRef = useRef(null);
+  const timerRef = useRef(null);
   const [status, setStatus] = useState('loading'); // loading | scanning | error
   const [errorMsg, setErrorMsg] = useState('');
+  const [hint, setHint] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
+    let hintTimer = null;
 
-    function tick() {
+    function scanFrame() {
       if (cancelled) return;
       const video = videoRef.current;
       const canvas = canvasRef.current;
-      if (video && canvas && video.readyState >= 2 && window.jsQR) {
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
-        const ctx = canvas.getContext('2d');
-        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-        const code = window.jsQR(imageData.data, imageData.width, imageData.height);
-        if (code && code.data) {
-          onDetect(code.data);
-          return;
+      if (video && canvas && video.readyState >= 2 && video.videoWidth) {
+        const scale = Math.min(1, SCAN_MAX_EDGE / Math.max(video.videoWidth, video.videoHeight));
+        const w = Math.max(1, Math.round(video.videoWidth * scale));
+        const h = Math.max(1, Math.round(video.videoHeight * scale));
+        if (canvas.width !== w || canvas.height !== h) {
+          canvas.width = w;
+          canvas.height = h;
+          ctxRef.current = null; // resizing a canvas resets its context state
+        }
+        if (!ctxRef.current) {
+          ctxRef.current = canvas.getContext('2d', { willReadFrequently: true });
+        }
+        const ctx = ctxRef.current;
+        if (ctx) {
+          ctx.drawImage(video, 0, 0, w, h);
+          const frame = ctx.getImageData(0, 0, w, h);
+          /* Tags are printed dark on white, so there is nothing to gain from
+             asking jsQR to try the inverted image too — and it doubles the
+             work on every frame that finds nothing, which is most of them. */
+          const code = jsQR(frame.data, w, h, { inversionAttempts: 'dontInvert' });
+          if (code && code.data) { onDetect(code.data); return; }
         }
       }
-      rafRef.current = requestAnimationFrame(tick);
+      timerRef.current = setTimeout(scanFrame, SCAN_INTERVAL_MS);
     }
 
     async function start() {
       try {
-        await loadScriptOnce(JSQR_SRC);
-        const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+        if (!navigator.mediaDevices?.getUserMedia) {
+          /* Undefined rather than throwing is what a browser does on an
+             insecure origin, and it is the single likeliest cause after a
+             denied permission: someone shared a plain http link or a LAN
+             address instead of the show's https one. */
+          const err = new Error('camera unavailable');
+          err.name = 'InsecureContext';
+          throw err;
+        }
+        // `ideal` rather than `exact`: a phone that cannot supply 1080p
+        // degrades to what it has instead of failing outright, and the hint
+        // is still enough to keep Safari off the ultra-wide lens.
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: {
+            facingMode: { ideal: 'environment' },
+            width: { ideal: 1920 },
+            height: { ideal: 1080 },
+          },
+        });
         if (cancelled) { stream.getTracks().forEach((t) => t.stop()); return; }
         streamRef.current = stream;
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-          await videoRef.current.play();
+        const video = videoRef.current;
+        if (video) {
+          video.srcObject = stream;
+          try {
+            await video.play();
+          } catch (playErr) {
+            /* iOS rejects this in situations where the stream is running
+               perfectly well. Reporting a camera failure with a live picture
+               on screen is worse than saying nothing, so let the frame loop
+               decide and leave the reason in the console. */
+            // eslint-disable-next-line no-console
+            console.warn('[BrushScore] video.play() rejected:', playErr?.name);
+          }
         }
-        if (!cancelled) { setStatus('scanning'); tick(); }
-      } catch (e) {
         if (!cancelled) {
-          setStatus('error');
-          setErrorMsg(
-            e && (e.name === 'NotAllowedError' || e.name === 'SecurityError')
-              ? 'Camera access was blocked. Allow camera access, or enter the number manually.'
-              : 'Could not start the camera on this device. Enter the number manually instead.'
-          );
+          setStatus('scanning');
+          hintTimer = setTimeout(() => { if (!cancelled) setHint(true); }, SCAN_HINT_AFTER_MS);
+          scanFrame();
         }
+      } catch (e) {
+        // eslint-disable-next-line no-console
+        console.error('[BrushScore] camera failed:', e?.name, e);
+        if (!cancelled) { setStatus('error'); setErrorMsg(cameraErrorMessage(e)); }
       }
     }
 
     start();
     return () => {
       cancelled = true;
-      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      if (timerRef.current) clearTimeout(timerRef.current);
+      if (hintTimer) clearTimeout(hintTimer);
       if (streamRef.current) streamRef.current.getTracks().forEach((t) => t.stop());
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1068,7 +1238,7 @@ function QrScanner({ onDetect, onClose, title }) {
           </button>
         </div>
         <div className="relative rounded-xl overflow-hidden bg-black" style={{ aspectRatio: '1 / 1' }}>
-          <video ref={videoRef} className="w-full h-full object-cover" muted playsInline />
+          <video ref={videoRef} className="w-full h-full object-cover" autoPlay muted playsInline />
           <canvas ref={canvasRef} className="hidden" />
           {status === 'scanning' && <div className="absolute inset-6 border-2 border-amber-400 rounded-lg pointer-events-none" />}
           {status === 'loading' && (
@@ -1078,6 +1248,12 @@ function QrScanner({ onDetect, onClose, title }) {
           )}
         </div>
         {status === 'error' && <p className="text-red-300 text-sm mt-3 text-center">{errorMsg}</p>}
+        {status === 'scanning' && hint && (
+          <p className="text-amber-200 text-xs mt-3 text-center">
+            Not reading? Hold the phone about ten inches back rather than close in, keep the whole
+            tag in the frame, and angle it away from overhead glare.
+          </p>
+        )}
         <button onClick={onClose} className="w-full mt-4 text-slate-300 hover:text-white text-sm underline">
           Enter the number manually instead
         </button>
@@ -1978,7 +2154,7 @@ function ScopeChooser({ group, result, onSetScope }) {
   );
 }
 
-function GroupCard({ group, config, record, teamId, seat, judgeNumber, judgeName, onSetScope, onSetMark, categoryLabel, forceOpen }) {
+function GroupCard({ group, config, record, teamId, seat, judgeNumber, judgeName, onSetScope, onSetMark, categoryLabel, forceOpen, locked }) {
   const [open, setOpen] = useState(false);
   useEffect(() => { if (forceOpen) setOpen(true); }, [forceOpen]);
 
@@ -2038,7 +2214,7 @@ function GroupCard({ group, config, record, teamId, seat, judgeNumber, judgeName
             })}
           </div>
 
-          {result.needsScope && <ScopeChooser group={group} result={result} onSetScope={onSetScope} />}
+          {result.needsScope && !locked && <ScopeChooser group={group} result={result} onSetScope={onSetScope} />}
 
           {result.scopeSet && (
             <div className="mt-3">
@@ -2047,7 +2223,18 @@ function GroupCard({ group, config, record, teamId, seat, judgeNumber, judgeName
           )}
           {result.flags.map((f) => <FlagNote key={f.key} flag={f} />)}
 
-          {conflict ? (
+          {locked ? (
+            /* Marks are stored against a seat within a team. A group that
+               belongs to no category is in every team's queue at once, so two
+               teams marking it would be writing to the same three seats and
+               overwriting each other. Visible, so it cannot be missed;
+               read-only, so it cannot be corrupted while it is wrong. */
+            <div className="text-xs rounded p-2 mt-3 bg-amber-50 text-amber-900">
+              <strong>Not markable yet</strong> — this exhibitor's work has no valid category, so no
+              team owns it. Ask the Awards Committee Chairman to set its category in the Organizer
+              Console; it will appear in the right team's queue within a few seconds of the fix.
+            </div>
+          ) : conflict ? (
             <div className="text-xs rounded p-2 mt-3 bg-red-50 text-red-800">
               <strong>{flagLabel('conflict')}</strong> — this is your own work. Judges do not judge their own
               entries; another judge on the team scores this one.
@@ -2264,19 +2451,43 @@ function JudgeView({ config, entries, groupRecords, votes, onSetScope, onSetMark
     return !owner || owner.id === team?.id;
   });
   const myCatIds = new Set(myCategories.map((c) => c.id));
+  const knownCatIds = knownCategoryIds(config);
 
-  const groups = buildGroups(entries)
-    .filter((g) => myCatIds.has(g.categoryId))
-    .filter((g) => categoryId === 'all' || g.categoryId === categoryId);
+  /* A group whose category id is not in the show config belongs to no
+     category at all, so it matched no team and disappeared from every
+     judge's queue at once while still sitting in the Organizer Console
+     looking perfectly normal. It is listed for every team instead, flagged
+     and read-only, on the same principle that already governs a category
+     nobody was assigned: better seen and reported than never seen. */
+  const isStray = (g) => !knownCatIds.has(g.categoryId);
+  const inMyQueue = (g) => isStray(g) || myCatIds.has(g.categoryId);
 
-  const done = groups.filter((g) => {
+  const allGroups = buildGroups(entries);
+  const strayGroups = allGroups.filter(isStray);
+  const strayPieces = strayGroups.reduce((n, g) => n + g.entries.length, 0);
+
+  const groups = allGroups
+    .filter(inMyQueue)
+    .filter((g) => {
+      if (categoryId === 'all') return true;
+      if (categoryId === STRAY_CATEGORY) return isStray(g);
+      return g.categoryId === categoryId;
+    });
+
+  // Stray groups are read-only, so counting them in the denominator would
+  // leave a team permanently short of a total it has no way to reach.
+  const markable = groups.filter((g) => !isStray(g));
+  const done = markable.filter((g) => {
     const r = computeGroup(groupRecords[g.key], judgeCountForGroup(config, g.categoryId), g.entries.map((e) => e.id));
     return r.complete && r.scopeSet;
   }).length;
 
   const jumpToGroup = (g) => {
     if (!g) return;
-    setCategoryId(g.categoryId);
+    // A stray group's category id is not one of the dropdown's options, so
+    // selecting it would filter the list down to nothing and hide the very
+    // group being jumped to.
+    setCategoryId(isStray(g) ? STRAY_CATEGORY : g.categoryId);
     setHighlight(g.key);
     setTimeout(() => setHighlight(null), 2500);
   };
@@ -2290,8 +2501,8 @@ function JudgeView({ config, entries, groupRecords, votes, onSetScope, onSetMark
   const doJump = (e) => {
     e.preventDefault();
     const g = findGroupByNumber(Number(jump.trim()));
-    if (g && myCatIds.has(g.categoryId)) jumpToGroup(g);
-    else if (g) notify('That entry belongs to another team\u2019s category.', 'error');
+    if (g && inMyQueue(g)) jumpToGroup(g);
+    else if (g) notify('That entry belongs to another team’s category.', 'error');
     setJump('');
   };
 
@@ -2301,7 +2512,7 @@ function JudgeView({ config, entries, groupRecords, votes, onSetScope, onSetMark
     if (number == null) { notify("That code isn't a BrushScore entry.", 'error'); return; }
     const g = findGroupByNumber(number);
     if (!g) { notify(`No entry found for #${number}.`, 'error'); return; }
-    if (!myCatIds.has(g.categoryId)) { notify('That entry belongs to another team\u2019s category.', 'error'); return; }
+    if (!inMyQueue(g)) { notify('That entry belongs to another team’s category.', 'error'); return; }
     jumpToGroup(g);
   };
 
@@ -2309,7 +2520,7 @@ function JudgeView({ config, entries, groupRecords, votes, onSetScope, onSetMark
     <div className="max-w-2xl mx-auto px-4 py-6">
       <h2 className="sb-display text-2xl mb-1">Judging</h2>
       <p className="text-slate-500 text-sm mb-3">
-        {tab === 'groups' ? `${done} of ${groups.length} fully marked in this view` : 'Special awards ballot'}
+        {tab === 'groups' ? `${done} of ${markable.length} fully marked in this view` : 'Special awards ballot'}
       </p>
 
       <JudgeIdentityPicker config={config} judgeNumber={judgeNumber} onChange={setJudgeNumber} />
@@ -2321,6 +2532,20 @@ function JudgeView({ config, entries, groupRecords, votes, onSetScope, onSetMark
         <p className="text-slate-400 text-sm text-center py-10">
           Choose your name above to start judging.
         </p>
+      ) : !team ? (
+        /* A judge on the roster but on no team matches no category, so the
+           queue came up empty or nearly so and read as "nothing to judge
+           yet" rather than as a configuration mistake. Say which it is. */
+        <div className="rounded-lg border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900">
+          <p className="font-semibold mb-1 flex items-center gap-1.5">
+            <AlertTriangle size={15} /> You are not on a judging team
+          </p>
+          <p>
+            Nothing can be marked or voted on until you are. Ask the Awards Committee Chairman to
+            assign you to a team in Organizer &rarr; Settings, then tap Refresh at the top of this
+            page.
+          </p>
+        </div>
       ) : (
       <>
       <div className="flex gap-1 mb-4 border-b border-slate-200">
@@ -2347,10 +2572,24 @@ function JudgeView({ config, entries, groupRecords, votes, onSetScope, onSetMark
         />
       ) : (
       <>
+      {strayGroups.length > 0 && (
+        <div className="mb-3 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900 flex gap-2">
+          <AlertTriangle size={14} className="shrink-0 mt-0.5" />
+          <p>
+            <strong>{strayPieces} {strayPieces === 1 ? 'entry has' : 'entries have'} no valid category.</strong>{' '}
+            They are listed here so they are not missed, but they cannot be marked until the
+            organizer gives them a category. Tell the Awards Committee Chairman.
+          </p>
+        </div>
+      )}
+
       <div className="flex gap-2 mb-4">
         <select className="sb-input flex-1" value={categoryId} onChange={(e) => setCategoryId(e.target.value)}>
           <option value="all">All my categories</option>
           {myCategories.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+          {strayGroups.length > 0 && (
+            <option value={STRAY_CATEGORY}>{UNASSIGNED_CATEGORY_LABEL} ({strayPieces})</option>
+          )}
         </select>
         <form onSubmit={doJump} className="flex gap-1">
           <input className="sb-input sb-mono w-20" placeholder="Entry #" value={jump} onChange={(e) => setJump(e.target.value)} />
@@ -2362,7 +2601,12 @@ function JudgeView({ config, entries, groupRecords, votes, onSetScope, onSetMark
       </div>
 
       <div className="space-y-2">
-        {groups.length === 0 && <p className="text-slate-400 text-sm text-center py-10">Nothing to judge in this view yet.</p>}
+        {groups.length === 0 && (
+          <p className="text-slate-400 text-sm text-center py-10">
+            Nothing to judge in this view yet. If entries were registered after you opened this
+            page, tap Refresh at the top.
+          </p>
+        )}
         {groups.map((g) => (
           <GroupCard
             key={g.key}
@@ -2377,6 +2621,7 @@ function JudgeView({ config, entries, groupRecords, votes, onSetScope, onSetMark
             onSetMark={onSetMark}
             categoryLabel={categoryName(config, g.categoryId)}
             forceOpen={highlight === g.key}
+            locked={isStray(g)}
           />
         ))}
       </div>
@@ -2433,10 +2678,27 @@ function OverviewTab({ config, entries, groupRecords, onPublishToggle }) {
   const judged = rows.filter((r) => r.result.complete && r.result.scopeSet).length;
   const needsReview = rows.filter((r) => r.result.flags.some((f) => ['unselected', 'spread'].includes(f.key))).length;
   const byCategory = config.categories.map((c) => ({ ...c, count: entries.filter((e) => e.categoryId === c.id).length }));
-  const maxCount = Math.max(1, ...byCategory.map((c) => c.count));
+  const stray = strayEntries(config, entries);
+  const maxCount = Math.max(1, ...byCategory.map((c) => c.count), stray.length);
 
   return (
     <div className="space-y-6">
+      {stray.length > 0 && (
+        <div className="rounded-lg border border-red-300 bg-red-50 p-4 text-sm text-red-900">
+          <p className="font-semibold mb-1 flex items-center gap-1.5">
+            <AlertTriangle size={15} /> {stray.length} {stray.length === 1 ? 'entry has' : 'entries have'} no valid category
+          </p>
+          <p className="mb-2">
+            These belong to no category, so they are shown to every judging team rather than to the
+            one that should have them. Give each a category in the Entries tab and the teams sort
+            themselves out.
+          </p>
+          <p className="sb-mono text-xs">
+            {stray.slice(0, 12).map((e) => `#${pad(e.number)}`).join('  ')}
+            {stray.length > 12 ? `  +${stray.length - 12} more` : ''}
+          </p>
+        </div>
+      )}
       <div className="grid grid-cols-4 gap-3">
         <StatCard label="Entries" value={total} />
         <StatCard label="Checked in" value={checkedIn} />
@@ -2455,6 +2717,17 @@ function OverviewTab({ config, entries, groupRecords, onPublishToggle }) {
               <span className="w-6 text-right text-slate-500 sb-mono text-xs">{c.count}</span>
             </div>
           ))}
+          {/* Counted separately rather than dropped, so the bars add up to the
+              entry total and a discrepancy cannot hide here. */}
+          {stray.length > 0 && (
+            <div className="flex items-center gap-2 text-sm">
+              <span className="w-40 truncate text-red-700 font-medium">{UNASSIGNED_CATEGORY_LABEL}</span>
+              <div className="flex-1 bg-slate-100 rounded-full h-2 overflow-hidden">
+                <div className="bg-red-500 h-full" style={{ width: `${(stray.length / maxCount) * 100}%` }} />
+              </div>
+              <span className="w-6 text-right text-red-600 sb-mono text-xs">{stray.length}</span>
+            </div>
+          )}
         </div>
       </div>
       <div className="border-t border-slate-200 pt-5">
@@ -2486,6 +2759,7 @@ function OverviewTab({ config, entries, groupRecords, onPublishToggle }) {
 function EntriesTab({ config, entries, groupRecords, onUpdateEntry, onDeleteEntry }) {
   const [q, setQ] = useState('');
   const { byEntry } = buildAwards(entries, groupRecords, config);
+  const knownCatIds = knownCategoryIds(config);
   const filtered = entries
     .filter((e) => {
       return entryMatches(e, q);
@@ -2512,7 +2786,15 @@ function EntriesTab({ config, entries, groupRecords, onUpdateEntry, onDeleteEntr
                 </p>
               </div>
               <MedalChip medal={row ? row.result.finalMedal : null} size="sm" />
-              <select className="sb-input text-xs w-40" value={e.categoryId} onChange={(ev) => onUpdateEntry(e.id, { categoryId: ev.target.value })}>
+              {/* A stray category id matches no option, so the select used to
+                  render as though the first category were chosen and gave the
+                  organizer no way to tell the entry was broken. */}
+              <select
+                className={`sb-input text-xs w-40 ${knownCatIds.has(e.categoryId) ? '' : 'border-red-400 text-red-700 bg-red-50'}`}
+                value={knownCatIds.has(e.categoryId) ? e.categoryId : ''}
+                onChange={(ev) => onUpdateEntry(e.id, { categoryId: ev.target.value })}
+              >
+                {!knownCatIds.has(e.categoryId) && <option value="" disabled>{UNASSIGNED_CATEGORY_LABEL} — pick one</option>}
                 {config.categories.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
               </select>
               <button onClick={() => onDeleteEntry(e.id)} aria-label="Delete entry" className="p-2 text-slate-400 hover:text-red-600">
@@ -2943,9 +3225,20 @@ function PrintTab({ onPrintAllTags, onPrintResults, onPrintRules, onPrintSign, o
   );
 }
 
-function OrganizerView({ config, entries, groupRecords, votes, onUpdateConfig, onUpdateEntry, onDeleteEntry, onPublishToggle, onAssignAward, onRule, onPrintAllTags, onPrintResults, onPrintRules, onPrintSign, onDownloadDeck, deckBusy, onSyncCategories, categorySyncing }) {
+function OrganizerView({ config, entries, groupRecords, votes, onUpdateConfig, onUpdateEntry, onDeleteEntry, onPublishToggle, onAssignAward, onRule, onPrintAllTags, onPrintResults, onPrintRules, onPrintSign, onDownloadDeck, deckBusy, onSyncCategories, categorySyncing, onSyncPause }) {
   const [tab, setTab] = useState('overview');
   const [editingSettings, setEditingSettings] = useState(false);
+
+  /* The settings form holds a whole edited config in local state until Save.
+     A background sync landing in the middle of that would replace the config
+     underneath it, so the poll stands down while the form is open and picks
+     up again the moment it closes. */
+  const pauseRef = useRef(onSyncPause);
+  useEffect(() => { pauseRef.current = onSyncPause; }, [onSyncPause]);
+  useEffect(() => {
+    if (pauseRef.current) pauseRef.current(editingSettings);
+    return () => { if (pauseRef.current) pauseRef.current(false); };
+  }, [editingSettings]);
   // Switching tabs unmounts the settings form and throws away whatever was
   // typed into it. Silent data loss is what made a missed Save look like the
   // app ignoring the edit, so ask first.
@@ -3495,33 +3788,138 @@ export default function App() {
   const [unlocked, setUnlocked] = useState({ desk: false, judge: false, organizer: false });
   const [toast, setToast] = useState(null);
   const [printJob, setPrintJob] = useState(null);
+  const [lastSync, setLastSync] = useState(null);
+  const [syncing, setSyncing] = useState(false);
 
   const notify = (msg, type = 'ok') => { setToast({ msg, type }); setTimeout(() => setToast(null), 2400); };
 
-  const refresh = useCallback(async () => {
-    const cfgRaw = await safeGet('brushscore:config', true);
-    const entRaw = await safeGet('brushscore:entries', true);
-    const grpRaw = await safeGet('brushscore:groups', true);
-    const voteRaw = await safeGet('brushscore:votes', true);
-    const rawConfig = cfgRaw ? JSON.parse(cfgRaw) : null;
-    const normalized = normalizeConfig(rawConfig);
-    setConfig(normalized);
-    setEntries((entRaw ? JSON.parse(entRaw) : []).map(normalizeEntry));
-    setGroupRecords(grpRaw ? JSON.parse(grpRaw) : {});
-    setVotes(voteRaw ? JSON.parse(voteRaw) : {});
-    setLoading(false);
-    // If the default category list picked up names the saved show doesn't
-    // have yet, normalizeConfig just added them with fresh ids. Persist
-    // that once, immediately — otherwise the next reload generates new
-    // random ids again, and any entry registered under the first set in
-    // the meantime would point at a category id that no longer exists.
-    if (rawConfig && normalized.categories.length !== (rawConfig.categories || []).length) {
-      // Best effort — it simply re-merges on the next load if this fails.
-      await writeKey('brushscore:config', normalized);
+  /* The raw strings last applied to state. Every poll compares against these
+     before calling a setter, so a tick that finds nothing new costs one read
+     and no re-render — which matters because a re-render mid-judging closes
+     nothing but does churn every open group card. */
+  const appliedRef = useRef({ config: null, entries: null, groups: null, votes: null });
+
+  const applyShared = useCallback(async () => {
+    const [cfgRaw, entRaw] = await Promise.all([
+      safeGet('brushscore:config', true),
+      safeGet('brushscore:entries', true),
+    ]);
+    let normalized = null;
+    let rawConfig = null;
+    if (cfgRaw !== null && cfgRaw !== appliedRef.current.config) {
+      rawConfig = JSON.parse(cfgRaw);
+      normalized = normalizeConfig(rawConfig);
+      appliedRef.current.config = cfgRaw;
+      setConfig(normalized);
+    }
+    if (entRaw !== null && entRaw !== appliedRef.current.entries) {
+      appliedRef.current.entries = entRaw;
+      setEntries(JSON.parse(entRaw).map(normalizeEntry));
+    }
+    return { rawConfig, normalized };
+  }, []);
+
+  const applyRecords = useCallback(async () => {
+    const [grpRaw, voteRaw] = await Promise.all([
+      safeGet('brushscore:groups', true),
+      safeGet('brushscore:votes', true),
+    ]);
+    if (grpRaw !== appliedRef.current.groups) {
+      appliedRef.current.groups = grpRaw;
+      setGroupRecords(grpRaw ? JSON.parse(grpRaw) : {});
+    }
+    if (voteRaw !== appliedRef.current.votes) {
+      appliedRef.current.votes = voteRaw;
+      setVotes(voteRaw ? JSON.parse(voteRaw) : {});
     }
   }, []);
 
+  const refresh = useCallback(async () => {
+    const { rawConfig, normalized } = await applyShared();
+    await applyRecords();
+    setLastSync(Date.now());
+    setLoading(false);
+    // If the default category list picked up names the saved show doesn't
+    // have yet, normalizeConfig just added them. Persist that once,
+    // immediately, so the ids are pinned in the store rather than re-derived
+    // on every load.
+    if (rawConfig && normalized && normalized.categories.length !== (rawConfig.categories || []).length) {
+      // Best effort — it simply re-merges on the next load if this fails.
+      if (await writeKey('brushscore:config', normalized)) {
+        appliedRef.current.config = JSON.stringify(normalized);
+      }
+    }
+  }, [applyShared, applyRecords]);
+
   useEffect(() => { refresh(); }, [refresh]);
+
+  /* ------------------------------ staying current ------------------------------
+
+     Everything used to be read once, at mount, and never again. A judge's
+     tablet opened before doors therefore held a snapshot of the entry list
+     from before doors: every walk-in, every category correction, every
+     roster change after that was invisible on that device until somebody
+     thought to reload, and the entries were plainly there in the Organizer
+     Console the whole time. That is the shape of "in the system but not
+     showing for judges", and no amount of scanning fixes it.
+
+     The poll pulls entries and config only. Group marks and votes are
+     deliberately left to the manual refresh: this device may have written a
+     mark seconds ago and be waiting on the round trip, and a poll landing in
+     that window would put the pre-mark copy back on screen, which reads as
+     the app rejecting the mark. `hasPendingWrites` closes the same window
+     from the other side.
+  --------------------------------------------------------------------------- */
+  const syncBusyRef = useRef(false);
+  const syncPausedRef = useRef(false);
+
+  const syncNow = useCallback(async ({ manual = false } = {}) => {
+    if (syncBusyRef.current) return;
+    if (!manual && (syncPausedRef.current || document.hidden)) return;
+    if (hasPendingWrites()) {
+      if (!manual) return;
+      // A press should do something. Give the write in flight a moment to
+      // land rather than pulling the copy it is about to replace.
+      await new Promise((r) => setTimeout(r, 800));
+    }
+    syncBusyRef.current = true;
+    setSyncing(true);
+    try {
+      await applyShared();
+      // Only on an explicit press, and only when nothing of ours is in the
+      // air, so a judge can recover another team's progress on demand
+      // without the background poll ever touching their own marks.
+      if (manual && !hasPendingWrites()) await applyRecords();
+      setLastSync(Date.now());
+    } catch (e) {
+      /* Leave the last good snapshot on screen. A failed poll is a stale
+         screen, which the age indicator already reports; replacing it with
+         an error would be worse. */
+      // eslint-disable-next-line no-console
+      console.warn('[BrushScore] sync failed:', e?.message);
+    } finally {
+      syncBusyRef.current = false;
+      setSyncing(false);
+    }
+  }, [applyShared, applyRecords]);
+
+  useEffect(() => {
+    if (loading) return undefined;
+    const id = setInterval(() => { syncNow(); }, SYNC_INTERVAL_MS);
+    // A phone put in a pocket between groups suspends its timers, so coming
+    // back to the tab is the moment most likely to be showing stale data.
+    const onVisible = () => { if (!document.hidden) syncNow(); };
+    const onOnline = () => { syncNow(); };
+    document.addEventListener('visibilitychange', onVisible);
+    window.addEventListener('online', onOnline);
+    window.addEventListener('focus', onVisible);
+    return () => {
+      clearInterval(id);
+      document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener('online', onOnline);
+      window.removeEventListener('focus', onVisible);
+    };
+  }, [loading, syncNow]);
 
   // Trigger the browser print dialog once the print layer has actually
   // painted, and clear the job afterward so the next print starts fresh.
@@ -3535,6 +3933,10 @@ export default function App() {
 
   const saveConfigNow = async (cfg) => {
     setConfig(cfg);
+    // Record what we just wrote as already applied. Without this the next
+    // poll reads back our own change, sees a string it has not seen, and
+    // re-sets state with identical data every twenty seconds.
+    appliedRef.current.config = JSON.stringify(cfg);
     if (await writeKey('brushscore:config', cfg)) return true;
     notify('Not saved — check your connection and redo that change.', 'error');
     return false;
@@ -3542,6 +3944,7 @@ export default function App() {
 
   const saveEntriesNow = async (list) => {
     setEntries(list);
+    appliedRef.current.entries = JSON.stringify(list);
     if (await writeKey('brushscore:entries', list)) return true;
     notify('Not saved — check your connection and redo that change.', 'error');
     return false;
@@ -3587,6 +3990,7 @@ export default function App() {
     const delta = typeof patch === 'function' ? patch(current) : patch;
     const next = { ...latest, [key]: { ...current, ...delta } };
     setGroupRecords(next);
+    appliedRef.current.groups = JSON.stringify(next);
     if (!(await writeKey('brushscore:groups', next))) {
       notify('Not saved — check your connection and redo that mark.', 'error');
     }
@@ -3632,6 +4036,7 @@ export default function App() {
     else forAward[judgeNumber] = value;
     const next = { ...latest, [awardId]: forAward };
     setVotes(next);
+    appliedRef.current.votes = JSON.stringify(next);
     if (!(await writeKey('brushscore:votes', next))) {
       notify('Not saved — check your connection and redo that vote.', 'error');
     }
@@ -3800,7 +4205,13 @@ export default function App() {
       <GlobalStyles />
       <div className="min-h-screen bg-slate-50 sb-root no-print">
         {view !== 'landing' && (
-          <TopBar title={viewTitle(view)} onBack={registrantOnly ? null : () => nav('landing')} />
+          <TopBar
+            title={viewTitle(view)}
+            onBack={registrantOnly ? null : () => nav('landing')}
+            lastSync={lastSync}
+            syncing={syncing}
+            onRefresh={() => syncNow({ manual: true })}
+          />
         )}
         {view === 'landing' && <Landing config={config} entries={entries} onNav={nav} onPrintTag={(entry) => printTags([entry])} />}
         {view === 'register' && <RegisterView config={config} onSubmit={(form) => addEntry(form, false)} onPrintTag={(entry) => printTags([entry])} />}
@@ -3844,6 +4255,7 @@ export default function App() {
               onPrintSign={printRegistrationSign}
               onSyncCategories={syncCategories}
               categorySyncing={categorySyncing}
+              onSyncPause={(paused) => { syncPausedRef.current = paused; }}
             />
           </PinGate>
         )}
